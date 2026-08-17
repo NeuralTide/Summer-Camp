@@ -5,6 +5,7 @@ import {
   authoredLessons,
   BuildConfigSchema,
   CurationModeSchema,
+  findLesson,
   lessonSequence,
   prefixedId,
   shortId,
@@ -15,6 +16,7 @@ import {
   type Course,
   type CourseLevel,
   type CurationMode,
+  type Exercise,
   type Store,
 } from "@metaharness/core";
 import {
@@ -31,6 +33,7 @@ import {
   authorLessonsPrompt,
   chatReplyPrompt,
   researchAndPlanPrompt,
+  reviseLessonPrompt,
   type ChatTurn,
 } from "./prompts.js";
 
@@ -70,7 +73,44 @@ export interface BuildJob {
 const STAGE_TIMEOUT_MS = {
   plan: 12 * 60 * 1000,
   author: 20 * 60 * 1000,
+  /** One lesson, and the learner is watching a spinner for it. */
+  revise: 5 * 60 * 1000,
 } as const;
+
+export type ReviseOutcome = "corrected" | "unchanged" | "failed";
+
+export interface ReviseResult {
+  outcome: ReviseOutcome;
+  /** Addressed to the learner: what was wrong, or why the lesson stands. */
+  message: string;
+  /** Exercises whose SRS history was discarded because their content moved. */
+  cardsReset: number;
+}
+
+/**
+ * Identity of an exercise's *content*, ignoring its id.
+ *
+ * Used to tell a genuinely rewritten exercise from one the agent left alone
+ * while rewriting its neighbours. Keys are sorted because two objects that a
+ * reader would call identical can serialise differently on key order alone,
+ * and that would reset a card for no reason.
+ */
+function exerciseFingerprint(exercise: Exercise): string {
+  const seen = new WeakSet<object>();
+  const stable = (value: unknown): unknown => {
+    if (value === null || typeof value !== "object") return value;
+    if (seen.has(value as object)) return null;
+    seen.add(value as object);
+    if (Array.isArray(value)) return value.map(stable);
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([k]) => k !== "id")
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([k, v]) => [k, stable(v)]),
+    );
+  };
+  return JSON.stringify(stable(exercise));
+}
 
 /** Short, because someone is sitting there waiting for the reply. */
 const INTERVIEW_TIMEOUT_MS = 90 * 1000;
@@ -203,6 +243,125 @@ export class Builder {
 
     if (!result.ok) throw new Error(result.error ?? `${driver.name} failed to reply.`);
     return { ...parseControlBlock(result.text), driver: driver.id };
+  }
+
+  /**
+   * Re-check one lesson against a learner's objection, and rewrite it if the
+   * objection is right.
+   *
+   * This is the thing a hosted course generator structurally cannot offer: the
+   * agent is already on this machine and the course is a file on disk, so a
+   * reported error can be verified and repaired in place instead of being
+   * filed against a vendor.
+   *
+   * Runs in the foreground. It is one lesson, the learner is waiting on the
+   * answer, and unlike a build there is nothing useful to show them in the
+   * meantime.
+   */
+  async reviseLesson(courseId: string, lessonId: string, objection: string): Promise<ReviseResult> {
+    const course = this.store.getCourse(courseId);
+    if (!course) throw new Error("Unknown course.");
+    const found = findLesson(course, lessonId);
+    if (!found) throw new Error("Unknown lesson.");
+    if (!found.lesson.authored) throw new Error("That lesson has not been written yet.");
+
+    const config = this.store.getConfig();
+    const { driver } = await this.registry.resolve(config.driver, { requireMcp: true });
+    const mcpServers = this.mcpServers(courseId);
+    const workDir = await prepareWorkspace(join(this.store.dir, "work", courseId), driver.id, mcpServers);
+    const hasWebSearch = driver.id === "claude";
+
+    // Content identity before the run, so a rewrite can be told from a no-op
+    // exercise-by-exercise rather than by trusting the agent's own account.
+    const before = new Map(found.lesson.exercises.map((e) => [e.id, exerciseFingerprint(e)]));
+
+    const result = await driver.run({
+      prompt: reviseLessonPrompt({
+        course,
+        unitTitle: found.unit.title,
+        lesson: found.lesson,
+        objection,
+        hasWebSearch,
+      }),
+      systemPrompt: AUTHOR_SYSTEM_PROMPT,
+      ...(config.model ? { model: config.model } : {}),
+      ...(config.effort ? { effort: config.effort } : {}),
+      cwd: workDir,
+      mcpServers,
+      allowedTools: allowedToolsFor("revise", hasWebSearch),
+      timeoutMs: STAGE_TIMEOUT_MS.revise,
+    });
+
+    if (!result.ok) {
+      return { outcome: "failed", message: result.error ?? `${driver.name} could not check this lesson.`, cardsReset: 0 };
+    }
+
+    const after = findLesson(this.store.getCourse(courseId)!, lessonId);
+    const wrote = after ? this.lessonChanged(before, after.lesson.exercises, found.lesson.notes, after.lesson.notes) : false;
+    const changed = wrote && after ? await this.resetMovedCards(before, after.lesson.exercises) : 0;
+
+    const reply = result.text.trim();
+    const declined = /^UNCHANGED\b/i.test(reply);
+    const message = reply.replace(/^(CORRECTED|UNCHANGED)\s*:?\s*/i, "").split("\n")[0]?.trim() ?? "";
+
+    if (wrote) {
+      this.bus.emit({ type: "course.updated", course: summarize(this.store.getCourse(courseId)!) });
+      return {
+        outcome: "corrected",
+        message: message || "The lesson has been corrected.",
+        cardsReset: changed,
+      };
+    }
+
+    return {
+      // The agent said it corrected something but nothing in the lesson moved.
+      // Report what actually happened rather than what it claimed.
+      outcome: "unchanged",
+      message:
+        message ||
+        (declined ? "The lesson looks right as written." : "No change was made to this lesson."),
+      cardsReset: 0,
+    };
+  }
+
+  /** True if the notes or any exercise differs from the pre-run snapshot. */
+  private lessonChanged(
+    before: Map<string, string>,
+    after: Exercise[],
+    notesBefore: string,
+    notesAfter: string,
+  ): boolean {
+    if (notesBefore !== notesAfter) return true;
+    if (before.size !== after.length) return true;
+    return after.some((e) => before.get(e.id) !== exerciseFingerprint(e));
+  }
+
+  /**
+   * Discard the spaced-repetition history of every exercise whose content moved.
+   *
+   * A card records how well the learner remembers *an exercise*, and SM-2 reads
+   * that history to decide when to show it again. If the exercise has been
+   * rewritten underneath it — or deleted — the history describes something that
+   * no longer exists, and a card scheduled six weeks out would keep the
+   * corrected version away for six weeks. Dropping the card entirely puts the
+   * new wording back in the rotation as unseen, which is what it is.
+   */
+  private async resetMovedCards(before: Map<string, string>, after: Exercise[]): Promise<number> {
+    const now = new Map(after.map((e) => [e.id, exerciseFingerprint(e)]));
+    const moved = [...before].filter(([id, fp]) => now.get(id) !== fp).map(([id]) => id);
+    // Only the ones the learner had actually answered have a card to drop, and
+    // only those are worth reporting back as lost progress.
+    const cards = this.store.getProgress().cards;
+    const stale = moved.filter((id) => cards[id]);
+    if (stale.length === 0) return 0;
+
+    await this.store.updateProgress((p) => {
+      const next = { ...p.cards };
+      for (const id of stale) delete next[id];
+      return { ...p, cards: next };
+    });
+    this.bus.emit({ type: "progress.updated" });
+    return stale.length;
   }
 
   /**

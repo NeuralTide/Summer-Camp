@@ -3776,3 +3776,45 @@ table.data tr:hover td {
     animation-iteration-count: infinite !important;
   }
 }
+
+/* ------------------------------------------------------------------ */
+/* Report a problem                                                    */
+/* ------------------------------------------------------------------ */
+
+/*
+  The one modal in the app, and it earns it: the check is a real agent turn
+  that takes up to a couple of minutes, and the verdict at the end is the
+  reason the learner asked. Anything dismissible by scrolling past would lose
+  it. The scrim dims here — unlike the settings tray, which sits over a page
+  you are still reading — because there is nothing behind this worth reading
+  until it answers.
+*/
+.report-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: var(--gutter);
+  background: rgba(39, 38, 34, 0.34);
+}
+
+.report-card {
+  width: 100%;
+  max-width: 460px;
+  text-align: left;
+}
+
+.report-card .textarea {
+  min-height: 96px;
+}
+
+/* Inherits the button's own colour so it reads as part of the label rather
+   than a separate object parked next to it. */
+.report-card .spinner {
+  width: 13px;
+  height: 13px;
+  border-width: 2px;
+  border-color: color-mix(in srgb, currentColor 30%, transparent);
+  border-top-color: currentColor;
+}

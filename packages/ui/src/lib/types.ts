@@ -279,3 +279,12 @@ export interface InterviewReply {
   ready?: ReadyBuild;
   driver: string;
 }
+
+/** Outcome of asking the agent to re-check a lesson. See Builder.reviseLesson. */
+export interface ReviseResult {
+  outcome: "corrected" | "unchanged" | "failed";
+  /** Written for the learner: what was wrong, or why the lesson stands. */
+  message: string;
+  /** Exercises whose spaced-repetition history was dropped because they moved. */
+  cardsReset: number;
+}
