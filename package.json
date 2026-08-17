@@ -2,7 +2,7 @@
   "name": "metaharness",
   "version": "0.1.0",
   "private": true,
-  "description": "Duolingo for everything — an agent-authored, harness-agnostic course engine.",
+  "description": "An open-source AI course generator that runs on whatever coding-agent CLI you already have.",
   "type": "module",
   "workspaces": [
     "packages/core",
@@ -26,5 +26,10 @@
   "devDependencies": {
     "@types/node": "^22.10.2",
     "typescript": "^5.7.2"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NeuralTide/Summer-Camp.git"
   }
 }
