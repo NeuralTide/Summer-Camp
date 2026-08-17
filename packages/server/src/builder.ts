@@ -574,7 +574,17 @@ export class Builder {
     this.bus.emit({ type: "course.updated", course: summarize(this.store.getCourse(job.courseId)!) });
 
     /* ------------------- Stage 2: author lessons in parallel ------------------- */
+    //
+    // Only the first few units, unless authorAhead is 0. The rest are written
+    // when the learner gets near them (see ensureAuthoredAhead): a course costs
+    // roughly its unit count in agent sessions, and most builds are abandoned
+    // long before the last unit is opened, so writing all of it up front spends
+    // the learner's tokens on lessons they will never see.
     this.setPhase(job, "authoring");
+    const ahead = request.buildConfig.authorAhead;
+    const initialUnits =
+      ahead > 0 ? Array.from({ length: Math.min(ahead, course.units.length) }, (_, i) => i) : undefined;
+
     await this.authorPass(
       job,
       driver.id,
@@ -584,6 +594,7 @@ export class Builder {
       workDir,
       signal,
       config.authorConcurrency,
+      initialUnits,
     );
 
     if (signal.aborted) return this.failJob(job, "Cancelled.");
@@ -591,8 +602,8 @@ export class Builder {
     // One retry for whatever the first pass missed — a worker that hits its timeout
     // or garbles a write should not cost the whole course.
     course = this.store.getCourse(job.courseId)!;
-    if (authoredLessons(course) < totalLessons(course)) {
-      const missing = totalLessons(course) - authoredLessons(course);
+    const missing = unwrittenIn(course, initialUnits);
+    if (missing > 0) {
       this.log(job, "warn", `${missing} lesson(s) unwritten — retrying those.`);
       await this.authorPass(
         job,
@@ -603,6 +614,7 @@ export class Builder {
         workDir,
         signal,
         Math.min(2, config.authorConcurrency),
+        initialUnits,
       );
     }
 
@@ -627,18 +639,41 @@ export class Builder {
     job.ok = true;
     job.finishedAt = new Date().toISOString();
     this.emitProgress(job);
+    const deferred = initialUnits ? totalLessons(course) - lessonsIn(course, initialUnits) : 0;
     this.log(
       job,
       "info",
       written === total
         ? `Course ready — ${total} lessons.`
-        : `Course ready with ${written} of ${total} lessons; the rest stay locked.`,
+        : deferred > 0 && written + deferred >= total
+          ? `Ready — ${written} lessons now, and the next unit is written when you reach it.`
+          : `Course ready with ${written} of ${total} lessons; the rest stay locked.`,
     );
     this.bus.emit({ type: "course.updated", course: summarize(this.store.getCourse(job.courseId)!) });
     this.bus.emit({ type: "build.finished", jobId: job.id, courseId: job.courseId, ok: true });
   }
 
-  /** Split unwritten lessons across N concurrent agent runs. */
+  /**
+   * Write the unwritten lessons of the given units, one agent session per unit.
+   *
+   * A session per unit rather than a session per worker, and that is the whole
+   * cost story of this app. `lesson_write` carries the entire lesson as its
+   * arguments, and a tool call stays in the conversation, so every lesson a
+   * session writes is re-sent on every request it makes afterwards. Writing 11
+   * lessons in one session spends about 62% of its input tokens re-sending
+   * lessons it already wrote; the same 11 lessons written as two units of
+   * five or six spend about 45%.
+   *
+   * Not one session per *lesson*, though, which is the obvious next step and is
+   * worse: the prompt is ~5,500 tokens of system instructions, outline and
+   * research notes, and paying that 33 times costs more than the quadratic it
+   * saves. A unit is close to the sweet spot between the two.
+   *
+   * Dealing by unit also replaced a round-robin deal across the whole course,
+   * which spread one failed worker's losses over every unit — see the gate in
+   * courseProgress that had to tolerate scattered holes. A unit now fails as a
+   * unit.
+   */
   private async authorPass(
     job: BuildJob,
     driverId: string,
@@ -650,28 +685,36 @@ export class Builder {
     workDir: string,
     signal: AbortSignal,
     concurrency: number,
+    /** Unit indices to write. Defaults to every unit with unwritten lessons. */
+    unitIndices?: number[],
   ): Promise<void> {
     const course = this.store.getCourse(job.courseId);
     if (!course) return;
 
-    const pending = lessonSequence(course).filter((e) => !e.lesson.authored);
+    const wanted = unitIndices ? new Set(unitIndices) : null;
+    const pending = lessonSequence(course).filter(
+      (e) => !e.lesson.authored && (!wanted || wanted.has(e.unitIndex)),
+    );
     if (pending.length === 0) return;
 
-    const workers = Math.max(1, Math.min(concurrency, pending.length));
-    const buckets: Array<typeof pending> = Array.from({ length: workers }, () => []);
-    // Deal round-robin so each worker gets a spread of the course rather than one
-    // worker taking every hard late-unit lesson.
-    pending.forEach((entry, i) => buckets[i % workers]!.push(entry));
+    // One bucket per unit, in course order.
+    const byUnit = new Map<number, typeof pending>();
+    for (const entry of pending) {
+      const bucket = byUnit.get(entry.unitIndex) ?? [];
+      bucket.push(entry);
+      byUnit.set(entry.unitIndex, bucket);
+    }
+    const buckets = [...byUnit.entries()].sort(([a], [b]) => a - b).map(([, v]) => v);
+    const workers = buckets.length;
 
     const outline = lessonSequence(course)
       .map((e) => `  ${e.unit.title} › ${e.lesson.title}${e.lesson.authored ? " (written)" : ""}`)
       .join("\n");
 
     const { driver } = await this.registry.resolve(driverId, { requireMcp: true });
-    this.log(job, "info", `Writing ${pending.length} lessons across ${workers} parallel worker(s).`);
+    this.log(job, "info", `Writing ${pending.length} lessons across ${workers} unit(s).`);
 
-    await Promise.all(
-      buckets.map(async (bucket, index) => {
+    await mapWithConcurrency(buckets, Math.max(1, concurrency), async (bucket, index) => {
         if (bucket.length === 0 || signal.aborted) return;
         const worker = index + 1;
         const result = await driver.run({
@@ -698,12 +741,11 @@ export class Builder {
           signal,
           onEvent: this.makeEventHandler(job, worker),
         });
-        if (!result.ok && !signal.aborted) {
-          this.log(job, "warn", `Worker ${worker} ended early: ${result.error ?? "unknown error"}`, worker);
-        }
-        this.emitProgress(job);
-      }),
-    );
+      if (!result.ok && !signal.aborted) {
+        this.log(job, "warn", `Worker ${worker} ended early: ${result.error ?? "unknown error"}`, worker);
+      }
+      this.emitProgress(job);
+    });
 
     this.bus.emit({ type: "course.updated", course: summarize(this.store.getCourse(job.courseId)!) });
   }
@@ -728,6 +770,103 @@ export class Builder {
     }
 
     this.bus.emit({ type: "build.finished", jobId: job.id, courseId: job.courseId, ok: false, error: message });
+  }
+
+  /**
+   * Keep the learner's next few units written, and write them if they are not.
+   *
+   * Called after a lesson is completed. Returns immediately — the authoring runs
+   * in the background, because the learner is on the summary screen and the unit
+   * being written is one they have not reached yet. By the time they finish the
+   * unit they are in, the next one is there.
+   *
+   * Idempotent and cheap when there is nothing to do, which is the common case:
+   * it is called after every single lesson and only acts on the one that
+   * finishes a unit.
+   */
+  async ensureAuthoredAhead(courseId: string): Promise<void> {
+    const course = this.store.getCourse(courseId);
+    if (!course || course.status === "planning" || course.status === "reviewing") return;
+
+    const ahead = course.buildConfig.authorAhead;
+    if (ahead <= 0) return;
+    // Already building this course: the running job will cover it.
+    if ([...this.jobs.values()].some((j) => j.courseId === courseId && !j.finishedAt)) return;
+
+    const progress = this.store.getProgress();
+    const seq = lessonSequence(course);
+    // The furthest unit with any completed lesson — where the learner actually
+    // is, rather than where the path says they could be.
+    const reached = seq.reduce(
+      (max, e) => ((progress.lessons[e.lesson.id]?.completions ?? 0) > 0 ? Math.max(max, e.unitIndex) : max),
+      0,
+    );
+
+    const wanted: number[] = [];
+    for (let i = 0; i <= Math.min(reached + ahead, course.units.length - 1); i++) {
+      if (course.units[i]!.lessons.some((l) => !l.authored)) wanted.push(i);
+    }
+    if (wanted.length === 0) return;
+
+    try {
+      await this.authorUnitsInBackground(courseId, wanted);
+    } catch {
+      // Nothing to tell the learner: they did not ask for this and the lessons
+      // are still locked either way. A failure here retries on the next lesson.
+    }
+  }
+
+  /** Start a job that writes the given units, and return once it is running. */
+  private async authorUnitsInBackground(courseId: string, unitIndices: number[]): Promise<void> {
+    const course = this.store.getCourse(courseId);
+    if (!course) return;
+    const config = this.store.getConfig();
+    const { driver } = await this.registry.resolve(config.driver, { requireMcp: true });
+
+    const controller = new AbortController();
+    const job: BuildJob = {
+      id: prefixedId("job"),
+      courseId,
+      courseTitle: course.title,
+      phase: "authoring",
+      driver: driver.id,
+      startedAt: new Date().toISOString(),
+      log: [],
+      authored: authoredLessons(course),
+      total: totalLessons(course),
+      cancel: () => controller.abort(),
+    };
+    this.jobs.set(job.id, job);
+    this.bus.emit({ type: "build.started", jobId: job.id, courseId, driver: driver.id });
+
+    const names = unitIndices.map((i) => course.units[i]!.title).join(", ");
+    this.log(job, "info", `Writing ahead: ${names}.`);
+
+    void (async () => {
+      try {
+        const mcpServers = this.mcpServers(courseId);
+        const workDir = await prepareWorkspace(join(this.store.dir, "work", courseId), driver.id, mcpServers);
+        await this.authorPass(
+          job,
+          driver.id,
+          config.model,
+          config.effort,
+          mcpServers,
+          workDir,
+          controller.signal,
+          config.authorConcurrency,
+          unitIndices,
+        );
+        job.phase = "done";
+        job.ok = true;
+        job.finishedAt = new Date().toISOString();
+        this.emitProgress(job);
+        this.bus.emit({ type: "course.updated", course: summarize(this.store.getCourse(courseId)!) });
+        this.bus.emit({ type: "build.finished", jobId: job.id, courseId, ok: true });
+      } catch (err) {
+        await this.failJob(job, (err as Error).message);
+      }
+    })();
   }
 
   /** Author only the lessons that are still stubs, for an existing course. */
@@ -822,3 +961,37 @@ function describeToolCall(name: string, input: unknown): string {
 }
 
 export { shortId };
+
+/**
+ * Run `fn` over every item with at most `limit` in flight.
+ *
+ * Replaces a Promise.all over one bucket per worker: buckets are now units, and
+ * there can be more units than the configured concurrency, so they have to
+ * queue rather than all start at once.
+ */
+async function mapWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  const runners = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (let i = next++; i < items.length; i = next++) {
+      await fn(items[i]!, i);
+    }
+  });
+  await Promise.all(runners);
+}
+
+/** Lessons belonging to the given units (all units when undefined). */
+function lessonsIn(course: Course, unitIndices?: number[]): number {
+  if (!unitIndices) return totalLessons(course);
+  const wanted = new Set(unitIndices);
+  return lessonSequence(course).filter((e) => wanted.has(e.unitIndex)).length;
+}
+
+/** Unwritten lessons within the given units (all units when undefined). */
+function unwrittenIn(course: Course, unitIndices?: number[]): number {
+  const wanted = unitIndices ? new Set(unitIndices) : null;
+  return lessonSequence(course).filter((e) => !e.lesson.authored && (!wanted || wanted.has(e.unitIndex))).length;
+}

@@ -360,6 +360,17 @@ export const BuildConfigSchema = z.object({
   maxExercisesPerLesson: z.number().int().min(3).max(12).default(8),
   /** Skip web search during planning and author from model knowledge alone. */
   skipResearch: z.boolean().default(false),
+  /**
+   * How many units to keep written ahead of the learner. 0 writes the whole
+   * course up front, as builds used to.
+   *
+   * Authoring a course is the expensive thing this app does, and most of that
+   * spend is on units nobody has reached — a 6-unit course costs about seven
+   * times a single unit, and a learner who abandons after unit 2 paid for four
+   * they never opened. Writing just ahead of the reader turns that into
+   * pay-as-you-go without them ever waiting on it.
+   */
+  authorAhead: z.number().int().min(0).max(8).default(1),
 });
 export type BuildConfig = z.infer<typeof BuildConfigSchema>;
 

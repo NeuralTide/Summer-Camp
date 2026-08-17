@@ -649,6 +649,11 @@ export function createApp(options: AppOptions): App {
     const after = store.getProgress();
     bus.emit({ type: "progress.updated" });
 
+    // Finishing a lesson may have brought the next unit into range. Fire and
+    // forget: the authoring is for a unit the learner has not reached, and
+    // nothing on this response depends on it.
+    void builder.ensureAuthoredAhead(active.courseId).catch(() => {});
+
     return {
       score,
       perfect,

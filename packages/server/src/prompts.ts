@@ -83,7 +83,7 @@ export function authorLessonsPrompt(input: AuthorPromptInput): string {
 
   const parallelNote =
     input.totalWorkers > 1
-      ? `\nYou are worker ${input.worker} of ${input.totalWorkers} writing this course in parallel. Write ONLY your assigned lessons — another worker is handling the rest, and writing theirs would overwrite their work.\n`
+      ? `\nYou are writing one unit of this course; ${input.totalWorkers} units are being written in parallel. Write ONLY your assigned lessons — another worker is handling the rest, and writing theirs would overwrite their work.\n`
       : "";
 
   return `Write the lessons listed below for the course "${course.title}" (${course.level}).
