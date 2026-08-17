@@ -358,6 +358,22 @@ function AboutTab({ course }: { course: CourseTree }) {
 
   return (
     <div className="stack">
+      {/*
+        Stated before the course describes itself, not tucked under it.
+
+        While the only reader is the person who generated it this is obvious and
+        redundant. It stops being either the moment a course is shared — and
+        courses are single JSON files that are meant to be shared — so the app
+        says it rather than relying on whoever passes the file on to remember.
+      */}
+      <div className="notice notice--info">
+        <IconInfo size={16} />
+        <span>
+          Written by an AI agent and not reviewed by a subject expert. It is confident even when it is wrong — check anything
+          you intend to rely on.
+        </span>
+      </div>
+
       <div className="card">
         <div className="eyebrow" style={{ marginBottom: 10 }}>
           About this course
