@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local editor / agent state. .claude/settings.json is shared config and is
+# tracked; settings.local.json is per-machine and is not.
+.claude/settings.local.json
+
+# Third-party agent skills, installed from higgsfield-ai/skills by the skill
+# tooling rather than authored here. They are 110 files of someone else's
+# content and have nothing to do with the course generator, so they stay out of
+# the repo; skills-lock.json records what to reinstall.
+.agents/
+.claude/skills/
+skills-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*

@@ -1,0 +1,41 @@
+/*
+  Instrument Sans — the display face. A grotesque with tight apertures, flat
+  terminals and slightly squared curves, which is the character the routed
+  unit-sign motif wants.
+
+  SIL Open Font License 1.1, so it ships with this repo rather than sitting in
+  it on borrowed terms. The licence travels with the font as the OFL requires:
+  see InstrumentSans-OFL.txt beside the .woff2. Copyright 2022 The Instrument
+  Sans Project Authors, https://github.com/Instrument/instrument-sans
+
+  This replaced a trial cut of Supria Sans, which was Personal Use Only and
+  carried 70 glyphs — A-Z, a-z, 0-9 and exactly four marks. No apostrophe, no
+  colon, no parentheses, no accents. Every one of those fell through to the next
+  family in the stack, so "It'll" and "(2-3)" were set in two typefaces at once,
+  and the display font could never be trusted with body copy. Instrument Sans
+  carries 343 glyphs and has none of that problem, which is why --font-display
+  can now name it first without the stack underneath doing corrective work.
+
+  One variable file, not four static cuts. app.css asks for 500, 600 and 700,
+  and a weight axis gives all three as real interpolations — where the old
+  family had no 600 at all and every one of its 23 call sites silently resolved
+  up to Bold.
+
+  The retail family also has a width axis (wdth 75-100). It is pinned to 100
+  here because nothing in the app sets a condensed width, and carrying it cost
+  40KB against a 46KB file. To bring it back, re-instance from the upstream
+  InstrumentSans[wdth,wght].ttf without pinning wdth.
+*/
+
+@font-face {
+  font-family: "Instrument Sans";
+  font-style: normal;
+  /* A range, not a value: this is one file covering the whole axis, and naming
+     the range is what lets the browser interpolate rather than synthesise. */
+  font-weight: 400 700;
+  font-display: swap;
+  /* Plain woff2 rather than the older format("woff2-variations") — the weight
+     range above is what declares this variable, and the legacy token is
+     unrecognised by some engines, which drops the face entirely. */
+  src: url("../fonts/instrument-sans.woff2") format("woff2");
+}

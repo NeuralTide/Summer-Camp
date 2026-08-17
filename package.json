@@ -1,0 +1,30 @@
+{
+  "name": "metaharness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Duolingo for everything — an agent-authored, harness-agnostic course engine.",
+  "type": "module",
+  "workspaces": [
+    "packages/core",
+    "packages/harness",
+    "packages/mcp",
+    "packages/server",
+    "packages/ui"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "npm run build -w @metaharness/core && npm run build -w @metaharness/harness && npm run build -w @metaharness/mcp && npm run build -w @metaharness/server && npm run build -w @metaharness/ui",
+    "build:libs": "npm run build -w @metaharness/core && npm run build -w @metaharness/harness && npm run build -w @metaharness/mcp && npm run build -w @metaharness/server",
+    "dev": "npm run dev -w @metaharness/server",
+    "dev:ui": "npm run dev -w @metaharness/ui",
+    "start": "node packages/server/dist/bin.js",
+    "seed": "node packages/server/dist/seed.js",
+    "typecheck": "tsc -b packages/core packages/harness packages/mcp packages/server"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
