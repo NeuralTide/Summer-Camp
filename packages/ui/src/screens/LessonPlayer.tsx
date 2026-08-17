@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ExercisePlayer } from "../components/exercises/ExercisePlayer";
-import { IconCheck, IconCross, IconHeart } from "../components/Icons";
+import { IconCheck, IconCross, IconHeart, IconInfo } from "../components/Icons";
 import { api, ApiError } from "../lib/api";
 import { renderMarkdown } from "../lib/markdown";
 import { useEvents } from "../lib/useEvents";
-import type { Answer, CompleteResponse, GradeResult, Session } from "../lib/types";
+import type { Answer, CompleteResponse, GradeResult, ReviseResult, Session } from "../lib/types";
 
 interface Props {
   session: Session;
@@ -40,6 +40,7 @@ export function LessonPlayer({ session, hearts: initialHearts, unlimitedHearts, 
 
   const answerGetter = useRef<(() => Answer) | null>(null);
   const [hasAnswer, setHasAnswer] = useState(false);
+  const [reporting, setReporting] = useState(false);
 
   const exerciseIndex = hasNotes ? step - 1 : step;
   const onReadingPage = hasNotes && step === 0;
@@ -130,6 +131,21 @@ export function LessonPlayer({ session, hearts: initialHearts, unlimitedHearts, 
           <IconCross size={18} />
         </button>
 
+        {/* Reachable from anywhere in the lesson, because you notice an error
+            while reading the notes as often as while answering. Practice
+            sessions draw from many lessons at once and have no single lesson to
+            report, so it is hidden there. */}
+        {session.lessonId && (
+          <button
+            className="btn btn--icon btn--ghost"
+            onClick={() => setReporting(true)}
+            title="Report a problem with this lesson"
+            aria-label="Report a problem with this lesson"
+          >
+            <IconInfo size={17} />
+          </button>
+        )}
+
         <div className="progress-pills">
           {Array.from({ length: steps }, (_, i) => (
             <span key={i} className="progress-pill" data-state={i < step ? "done" : i === step ? "current" : undefined} />
@@ -147,6 +163,15 @@ export function LessonPlayer({ session, hearts: initialHearts, unlimitedHearts, 
           </div>
         )}
       </div>
+
+      {reporting && session.lessonId && (
+        <ReportDialog
+          courseId={session.courseId}
+          lessonId={session.lessonId}
+          lessonTitle={session.lessonTitle}
+          onClose={() => setReporting(false)}
+        />
+      )}
 
       <div className="player__body">
         <div className="player__inner">
@@ -223,6 +248,118 @@ function OutOfHearts({ courseColor, onExit }: { courseColor: string; onExit: () 
         <button className="btn btn--primary btn--lg" style={{ marginTop: 22, background: courseColor }} onClick={onExit}>
           Back to course
         </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * "This looks wrong."
+ *
+ * Deliberately asks for the objection in words rather than offering a set of
+ * canned reasons. The agent has to re-derive the point to check it, and
+ * "factually incorrect" gives it nothing to check — where "attention is masked
+ * in GPT, so a token can't see future tokens" is a claim it can go and verify.
+ *
+ * The wait is a real agent turn, up to a couple of minutes, so this holds the
+ * dialog open with a spinner instead of closing optimistically: there is a
+ * verdict coming and it is the reason the learner asked.
+ */
+function ReportDialog({
+  courseId,
+  lessonId,
+  lessonTitle,
+  onClose,
+}: {
+  courseId: string;
+  lessonId: string;
+  lessonTitle: string;
+  onClose: () => void;
+}) {
+  const [objection, setObjection] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<ReviseResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    if (objection.trim().length < 4 || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setResult(await api.reportLesson(courseId, lessonId, objection.trim()));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Couldn't check this lesson.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="report-scrim" onClick={busy ? undefined : onClose}>
+      <div className="card report-card" onClick={(e) => e.stopPropagation()}>
+        {result ? (
+          <>
+            <div className="eyebrow" style={{ marginBottom: 10 }}>
+              {result.outcome === "corrected" ? "Lesson corrected" : result.outcome === "unchanged" ? "Lesson stands" : "Couldn't check it"}
+            </div>
+            <p style={{ margin: "0 0 14px", lineHeight: 1.6 }}>{result.message}</p>
+            {result.cardsReset > 0 && (
+              <p className="faint" style={{ fontSize: 12.5, margin: "0 0 14px" }}>
+                {result.cardsReset} exercise{result.cardsReset === 1 ? " was" : "s were"} rewritten, so{" "}
+                {result.cardsReset === 1 ? "its" : "their"} review history was cleared —{" "}
+                {result.cardsReset === 1 ? "it" : "they"} will come back around as new.
+              </p>
+            )}
+            <button className="btn btn--primary" style={{ width: "100%" }} onClick={onClose}>
+              {result.outcome === "corrected" ? "Reload the lesson to see it" : "Back to the lesson"}
+            </button>
+          </>
+        ) : (
+          <>
+            <div className="eyebrow" style={{ marginBottom: 4 }}>
+              Report a problem
+            </div>
+            <p className="faint" style={{ fontSize: 13, margin: "0 0 12px", lineHeight: 1.55 }}>
+              {lessonTitle}
+            </p>
+            <textarea
+              className="textarea"
+              autoFocus
+              placeholder="What's wrong? Be specific — the agent has to check the claim, so name it."
+              value={objection}
+              onChange={(e) => setObjection(e.target.value)}
+              disabled={busy}
+            />
+            {error && (
+              <div className="notice" style={{ marginTop: 12 }}>
+                {error}
+              </div>
+            )}
+            <p className="faint" style={{ fontSize: 12, margin: "12px 0 14px", lineHeight: 1.5 }}>
+              The agent re-checks the lesson and rewrites it only if you're right. It can decide you aren't.
+            </p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn btn--flat" style={{ flex: "none" }} onClick={onClose} disabled={busy}>
+                Cancel
+              </button>
+              <button
+                className="btn btn--primary"
+                style={{ flex: 1 }}
+                onClick={() => void submit()}
+                disabled={busy || objection.trim().length < 4}
+              >
+                {busy ? (
+                  <>
+                    <span className="spinner" />
+                    Checking…
+                  </>
+                ) : (
+                  "Check this lesson"
+                )}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

@@ -449,6 +449,27 @@ export function createApp(options: AppOptions): App {
 
   /* ------------------------------ progress ------------------------------ */
 
+  /**
+   * "This looks wrong." Verifies the objection against the lesson and rewrites
+   * it if the learner is right — see Builder.reviseLesson.
+   *
+   * Synchronous, unlike a build: it is one lesson, it takes a minute at most,
+   * and the answer is the whole point of asking.
+   */
+  router.post("/api/courses/:id/lessons/:lessonId/report", async ({ params, body }) => {
+    const input = parse(
+      z.object({ objection: z.string().trim().min(4).max(2000) }),
+      body,
+      "report",
+    );
+    requireCourse(store, params.id!);
+    try {
+      return await builder.reviseLesson(params.id!, params.lessonId!, input.objection);
+    } catch (err) {
+      throw new HttpError(400, (err as Error).message);
+    }
+  });
+
   router.get("/api/courses/:id/progress", () => {
     const progress = store.getProgress();
     return { progress: publicProgress(progress) };

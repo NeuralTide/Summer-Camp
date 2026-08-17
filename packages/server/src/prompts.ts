@@ -1,4 +1,4 @@
-import type { BuildConfig, Course, CourseLevel } from "@metaharness/core";
+import type { BuildConfig, Course, CourseLevel, Lesson } from "@metaharness/core";
 
 /**
  * The portable instruction pack.
@@ -143,8 +143,71 @@ Reply exactly:
 Feedback should say specifically what was right and what was missing. Write to the learner as "you". Be encouraging but honest.`;
 }
 
-/** Tools an authoring run is permitted to use. */
-export function allowedToolsFor(stage: "plan" | "author", hasWebSearch: boolean): string[] {
+export interface ReviseLessonPromptInput {
+  course: Course;
+  unitTitle: string;
+  lesson: Lesson;
+  /** What the learner says is wrong, in their own words. */
+  objection: string;
+  hasWebSearch: boolean;
+}
+
+/**
+ * Re-check one lesson against a learner's objection.
+ *
+ * The instruction that matters most here is the one telling the agent it is
+ * allowed to disagree. A model handed "this is wrong, fix it" will almost
+ * always find something to change, and a lesson rewritten to satisfy a
+ * misreading is worse than the lesson it replaced — the learner's confusion
+ * has been promoted into the course for everyone who takes it next.
+ *
+ * So the verdict comes first and the rewrite is conditional on it. The reply
+ * is a fixed one-word prefix rather than prose, because the server has to
+ * distinguish "declined" from "failed to run" and cannot infer that from an
+ * essay.
+ */
+export function reviseLessonPrompt(input: ReviseLessonPromptInput): string {
+  const { course, lesson, objection } = input;
+  const exercises = lesson.exercises
+    .map((e, i) => `${i + 1}. [${e.type}] ${e.prompt}\n   explanation: ${e.explanation}`)
+    .join("\n");
+
+  return `A learner has reported a problem with one lesson of the course "${course.title}" (${course.level}).
+
+Course id: ${course.id}
+Lesson id: ${lesson.id}
+Unit: ${input.unitTitle}
+Lesson: ${lesson.title}
+Objective: ${lesson.objective}
+
+THE LEARNER'S REPORT:
+${objection}
+
+CURRENT NOTES:
+${lesson.notes}
+
+CURRENT EXERCISES:
+${exercises}
+
+${course.researchNotes ? `RESEARCH NOTES gathered when this course was built:\n${course.researchNotes}\n` : ""}
+Work out whether the learner is right.${input.hasWebSearch ? " Search the web if the claim turns on a fact you are not certain of." : ""}
+
+They may not be. A confident, specific report can still rest on a misreading, and rewriting a correct lesson to agree with one turns a single reader's confusion into everyone's. Judge the lesson on the subject matter, not on how sure the report sounds.
+
+If the lesson is wrong, call \`lesson_write\` once for lesson id ${lesson.id} with the whole lesson corrected. Fix the reported problem and anything demonstrably wrong that you notice while checking, and leave everything else as it is — this is a correction, not a rewrite. Keep the same teaching order, and keep an exercise's wording identical unless that exercise is one of the ones at fault. The same validation applies as when the lesson was first written.
+
+If the lesson is right, change nothing and do not call \`lesson_write\`.
+
+Then reply with one line, starting with exactly one of these words:
+
+CORRECTED: <what was wrong and what you changed, one or two sentences, addressed to the learner as "you">
+UNCHANGED: <why the lesson is right as written, one or two sentences, addressed to the learner as "you">
+
+Write the explanation for someone learning the subject, not for a developer. No preamble, no code fence.`;
+}
+
+/** Tools a run is permitted to use, by stage. */
+export function allowedToolsFor(stage: "plan" | "author" | "revise", hasWebSearch: boolean): string[] {
   const mcp = [
     "mcp__metaharness__course_get",
     "mcp__metaharness__progress_get",
@@ -154,7 +217,9 @@ export function allowedToolsFor(stage: "plan" | "author", hasWebSearch: boolean)
     "mcp__metaharness__course_status",
   ];
   // Authoring never needs the web; the research pass already captured what it found.
-  if (stage === "plan" && hasWebSearch) return [...mcp, "WebSearch", "WebFetch"];
+  // A revision does: the whole question is whether a specific claim is true, and
+  // the research notes were gathered before anyone had doubted this one.
+  if (hasWebSearch && (stage === "plan" || stage === "revise")) return [...mcp, "WebSearch", "WebFetch"];
   return mcp;
 }
 

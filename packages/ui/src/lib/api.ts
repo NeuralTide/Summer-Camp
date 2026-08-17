@@ -1,19 +1,20 @@
 import type {
-  AnswerResponse,
   Answer,
+  AnswerResponse,
   AppConfig,
-  ChatTurn,
-  InterviewReply,
   BuildConfig,
   BuildJob,
+  ChatTurn,
   CompleteResponse,
   CourseProgressView,
   CourseSummary,
   CourseTree,
   CurationMode,
   DriverStatus,
+  InterviewReply,
   PlanUnit,
   Progress,
+  ReviseResult,
   Session,
   WeakArea,
 } from "./types";
@@ -92,6 +93,11 @@ export const api = {
   chat: (input: { messages: ChatTurn[]; driver?: string; model?: string }) =>
     call<InterviewReply>("POST", "/api/build/chat", input),
   resume: (id: string) => call<{ job: BuildJob }>("POST", `/api/courses/${id}/resume`, {}),
+
+  /** Ask the agent to re-check one lesson against an objection. Slow — it runs a
+   *  full agent turn — so callers should show a spinner rather than a skeleton. */
+  reportLesson: (courseId: string, lessonId: string, objection: string) =>
+    call<ReviseResult>("POST", `/api/courses/${courseId}/lessons/${lessonId}/report`, { objection }),
 
   manualCreate: (input: { title: string; level: string; icon?: string; color?: string; buildConfig: BuildConfig; units: PlanUnit[] }) =>
     call<{ course: CourseSummary }>("POST", "/api/courses/manual", input),
