@@ -30,6 +30,8 @@ import {
   weakAreas,
   loseHeart,
   completeLesson,
+  awardXp,
+  touchStreak,
   type Answer,
   type Course,
   type Exercise,
@@ -587,18 +589,33 @@ export function createApp(options: AppOptions): App {
       await store.updateProgress(() => outcome.progress);
     } else {
       // Practice pays per card reviewed rather than per lesson completed.
+      //
+      // Awarded directly rather than by running completeLesson against a
+      // synthetic "__practice__" lesson and correcting the total afterwards.
+      // That correction only adjusted `xp` and left `dailyXp` holding whatever
+      // the synthetic lesson had scored — a different number, and often zero,
+      // because awardXp short-circuits on a zero amount and the synthetic
+      // lesson was passed correctCount: 0. So practice XP either missed the
+      // daily goal ring entirely or filled it by the wrong amount.
+      //
+      // awardXp moves `xp` and `dailyXp` together, which is the invariant that
+      // was being broken; the streak and course timestamps are the only other
+      // things completeLesson was here for, and they are set explicitly below.
       xpAwarded = active.firstTryCorrect.size * RULES.xpPerReview;
       await store.updateProgress((p) => {
-        const outcome = completeLesson(p, active.courseId, `__practice__${active.courseId}`, {
-          score,
-          correctCount: 0,
-          perfect,
-        });
-        // Keep the streak and timestamps, drop the synthetic lesson record.
-        const lessons = { ...outcome.progress.lessons };
-        delete lessons[`__practice__${active.courseId}`];
-        const withXp = { ...outcome.progress, lessons };
-        return { ...withXp, xp: withXp.xp - outcome.xpAwarded + xpAwarded };
+        const now = new Date();
+        let next = awardXp(p, xpAwarded, now);
+        next = touchStreak(next, now);
+        return {
+          ...next,
+          courses: {
+            ...next.courses,
+            [active.courseId]: {
+              startedAt: next.courses[active.courseId]?.startedAt ?? now.toISOString(),
+              lastStudiedAt: now.toISOString(),
+            },
+          },
+        };
       });
     }
 
