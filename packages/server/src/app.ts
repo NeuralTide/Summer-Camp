@@ -522,8 +522,9 @@ export function createApp(options: AppOptions): App {
 
     const input = parse(z.object({ exerciseId: z.string(), answer: AnswerSchema }), body, "answer");
     const course = requireCourse(store, active.courseId);
-    const exercise = findExercise(course, input.exerciseId);
-    if (!exercise) throw new HttpError(404, "Unknown exercise.");
+    const found = findExercise(course, input.exerciseId);
+    if (!found) throw new HttpError(404, "Unknown exercise.");
+    const { exercise, lessonId: owningLessonId } = found;
     if (!active.exerciseIds.includes(input.exerciseId)) throw new HttpError(400, "That exercise is not in this session.");
 
     const result: GradeResult = gradeExercise(exercise, input.answer);
@@ -533,7 +534,12 @@ export function createApp(options: AppOptions): App {
     if (result.correct && !isRetry) active.firstTryCorrect.add(input.exerciseId);
     if (!result.correct) active.wrongCount += 1;
 
-    const lessonId = active.lessonId ?? exercise.id;
+    // The lesson the exercise actually belongs to, not the session's lesson: a
+    // practice session has none, and this used to fall back to the *exercise*
+    // id, so every card first seen during practice was persisted claiming a
+    // lesson that does not exist. Practice routinely creates cards, because
+    // buildPracticeSession tops a short queue up with never-seen exercises.
+    const lessonId = owningLessonId;
     const config = store.getConfig();
     let heartsLeft = store.getProgress().hearts;
 
@@ -761,11 +767,18 @@ function requireCourse(store: Store, idOrSlug: string): Course {
   return course;
 }
 
-function findExercise(course: Course, exerciseId: string): Exercise | undefined {
+/**
+ * The exercise, plus the lesson that owns it.
+ *
+ * The lesson matters because an SRS card records the lesson it belongs to, and
+ * a practice session has no lesson of its own — so the owner has to be resolved
+ * from the course tree rather than taken from the session.
+ */
+function findExercise(course: Course, exerciseId: string): { exercise: Exercise; lessonId: string } | undefined {
   for (const unit of course.units) {
     for (const lesson of unit.lessons) {
       const found = lesson.exercises.find((e) => e.id === exerciseId);
-      if (found) return found;
+      if (found) return { exercise: found, lessonId: lesson.id };
     }
   }
   return undefined;

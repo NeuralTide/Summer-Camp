@@ -151,14 +151,12 @@ export function buildPracticeSession(
   const rng = seededRandom(sessionId);
 
   const byId = new Map<string, Exercise>();
-  const lessonOf = new Map<string, string>();
   for (const unit of course.units) {
     for (const lesson of unit.lessons) {
       if (!lesson.authored) continue;
       if (opts.lessonIds && !opts.lessonIds.includes(lesson.id)) continue;
       for (const ex of lesson.exercises) {
         byId.set(ex.id, ex);
-        lessonOf.set(ex.id, lesson.id);
       }
     }
   }
