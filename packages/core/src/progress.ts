@@ -237,7 +237,17 @@ export function courseProgress(course: Course, progress: Progress, now = new Dat
       globalIndex: entry.globalIndex,
     });
 
-    previousPassed = completions > 0;
+    // An unwritten lesson is locked — there is nothing to play — but it must not
+    // gate what comes after it, or one hole closes the rest of the course.
+    //
+    // That matters because holes are not rare and are not contiguous. authorPass
+    // deals pending lessons round-robin across N workers so no single worker
+    // takes every hard late-unit lesson, which means a worker that times out
+    // loses every Nth lesson spread through the whole course rather than a clean
+    // tail. Gating on those would leave the learner stuck at the first gap with
+    // every written lesson beyond it locked. The builder ships partial courses
+    // on purpose ("the rest stay locked"); this is what makes that survivable.
+    if (entry.lesson.authored) previousPassed = completions > 0;
   }
 
   // Everything done once? Point "Continue" at the least-mastered lesson instead.
