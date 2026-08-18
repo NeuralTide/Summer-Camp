@@ -144,9 +144,9 @@ export function CourseScreen({ courseId, progress, onStartLesson, onStartPractic
     };
   }, [ready]);
 
-  const resume = async () => {
+  const resume = async (scope: "next" | "all") => {
     try {
-      await api.resume(courseId);
+      await api.resume(courseId, scope);
       await load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Couldn't resume authoring.");
@@ -173,7 +173,18 @@ export function CourseScreen({ courseId, progress, onStartLesson, onStartPractic
 
   const { course, view } = data;
   const building = phase !== null && phase !== "done" && phase !== "failed";
-  const stalled = course.status === "authoring" && !building;
+  const unwritten = course.lessonCount - course.authoredCount;
+  /**
+   * Unwritten lessons the last build did not mean to leave behind.
+   *
+   * A course that writes just ahead of the reader always has unwritten lessons,
+   * so the count alone says nothing. What made this worth distinguishing: a
+   * build that lost its lessons to a usage limit still finished as "ready", and
+   * the offer to write the rest was gated on a status it never had — leaving no
+   * way to reach the missing lessons from the UI at all.
+   */
+  const lost = course.lastBuild ? Math.max(0, unwritten - course.lastBuild.deferred) : 0;
+  const canWriteMore = unwritten > 0 && !building && course.status !== "planning" && course.status !== "reviewing";
 
   return (
     <div className="page course-page">
@@ -222,15 +233,31 @@ export function CourseScreen({ courseId, progress, onStartLesson, onStartPractic
               <div className="notice">{course.error ?? "Something went wrong while building this course."}</div>
             )}
 
-            {stalled && course.authoredCount < course.lessonCount && (
-              <div className="notice notice--info" style={{ alignItems: "center" }}>
-                <span style={{ flex: 1 }}>
-                  {course.lessonCount - course.authoredCount} lesson{course.lessonCount - course.authoredCount === 1 ? "" : "s"} still
-                  unwritten.
+            {canWriteMore && (
+              <div className={lost ? "notice" : "notice notice--info"} style={{ alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+                <span style={{ flex: 1, minWidth: 220 }}>
+                  {lost ? (
+                    <>
+                      <strong>This course didn’t finish building.</strong>{" "}
+                      {course.authoredCount} of {course.lessonCount} lessons were written
+                      {course.lastBuild?.detail ? ` — ${course.lastBuild.detail.replace(/\.$/, "")}` : ""}.
+                    </>
+                  ) : (
+                    <>
+                      {unwritten} lesson{unwritten === 1 ? "" : "s"} left to write. They’re written as you reach them — or start now.
+                    </>
+                  )}
                 </span>
-                <button className="btn btn--sm" onClick={resume}>
-                  Resume
+                {/* A unit at a time by default: writing everything at once is
+                    what exhausted the agent in the first place. */}
+                <button className="btn btn--sm" onClick={() => resume("next")}>
+                  Write next unit
                 </button>
+                {unwritten > 1 && (
+                  <button className="btn btn--sm btn--ghost" onClick={() => resume("all")}>
+                    Write all {unwritten}
+                  </button>
+                )}
               </div>
             )}
 
@@ -415,6 +442,68 @@ function AboutTab({ course }: { course: CourseTree }) {
               </div>
             ))}
           </div>
+          <ArchiveSources courseId={course.id} sourceCount={course.sources.length} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Fetch and keep a copy of every page this course cites.
+ *
+ * Offered here rather than done automatically at build time because it reaches
+ * out to a dozen third-party sites, and because it is worth doing to courses
+ * that were generated long before any of this existed — which is what makes it
+ * a button rather than a build step. It spends no model usage at all.
+ */
+function ArchiveSources({ courseId, sourceCount }: { courseId: string; sourceCount: number }) {
+  const [state, setState] = useState<"idle" | "working">("idle");
+  const [result, setResult] = useState<{ archived: number; failed: Array<{ title: string; failure?: string }> } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Loaded rather than assumed, so the button says what is actually on disk.
+  useEffect(() => {
+    let live = true;
+    api
+      .archivedCount(courseId)
+      .then((res) => live && setResult((prev) => prev ?? { archived: res.archived, failed: [] }))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [courseId]);
+
+  const run = async () => {
+    setState("working");
+    setError(null);
+    try {
+      setResult(await api.archiveSources(courseId));
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Couldn't archive the sources.");
+    } finally {
+      setState("idle");
+    }
+  };
+
+  const archived = result?.archived ?? 0;
+  return (
+    <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--cream-deeper)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <span className="faint" style={{ fontSize: 12.5, flex: 1, minWidth: 200 }}>
+          {archived > 0
+            ? `${archived} of ${sourceCount} sources archived — lesson paragraphs from these can be checked against them.`
+            : "Keep a copy of these pages so lesson text can be traced back to them. Costs no model usage."}
+        </span>
+        <button className="btn btn--sm" onClick={run} disabled={state === "working"}>
+          {state === "working" ? "Fetching…" : archived > 0 ? "Re-check" : "Archive sources"}
+        </button>
+      </div>
+      {error && <div style={{ fontSize: 12.5, marginTop: 8, color: "var(--wrong)" }}>{error}</div>}
+      {result && result.failed.length > 0 && (
+        <div className="faint" style={{ fontSize: 12, marginTop: 8, lineHeight: 1.6 }}>
+          {result.failed.length} couldn’t be fetched:{" "}
+          {result.failed.map((f) => `${f.title} (${f.failure ?? "unknown reason"})`).join("; ")}
         </div>
       )}
     </div>

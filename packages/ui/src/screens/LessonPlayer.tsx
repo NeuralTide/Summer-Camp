@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { ExercisePlayer } from "../components/exercises/ExercisePlayer";
 import { IconCheck, IconCross, IconHeart, IconInfo } from "../components/Icons";
+import { LessonChat } from "../components/LessonChat";
+import { SourcedNotes } from "../components/SourcedNotes";
 import { api, ApiError } from "../lib/api";
 import { renderMarkdown } from "../lib/markdown";
 import { useEvents } from "../lib/useEvents";
@@ -126,6 +128,11 @@ export function LessonPlayer({ session, hearts: initialHearts, unlimitedHearts, 
 
   return (
     <div className="player">
+      {/* Outside .player__body so it survives moving between the reading page
+          and the exercises — a question asked on step 1 is still worth having
+          an answer to on step 4. */}
+      <LessonChat courseId={session.courseId} lessonId={session.lessonId} lessonTitle={session.lessonTitle} />
+
       <div className="player__top">
         <button className="btn btn--icon btn--ghost" onClick={onExit} aria-label="Close lesson">
           <IconCross size={18} />
@@ -178,7 +185,7 @@ export function LessonPlayer({ session, hearts: initialHearts, unlimitedHearts, 
           {onReadingPage ? (
             <div className="article">
               <h1>{session.lessonTitle}</h1>
-              <div dangerouslySetInnerHTML={{ __html: notesHtml }} />
+              <SourcedNotes courseId={session.courseId} lessonId={session.lessonId} html={notesHtml} />
             </div>
           ) : exercise ? (
             <ExercisePlayer

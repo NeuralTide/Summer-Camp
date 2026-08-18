@@ -5,6 +5,7 @@ import { dirname, join, resolve } from "node:path";
 import { CourseSchema, formatZodError, type Course } from "./schema.js";
 import { emptyProgress, settleHearts, type Progress } from "./progress.js";
 import { shortId } from "./ids.js";
+import type { ArchivedSource } from "./archive.js";
 
 /**
  * Content lives as one JSON file per course on disk, and progress in a single JSON
@@ -42,6 +43,13 @@ export interface AppConfig {
   dailyGoalXp: number;
   /** Practise without losing hearts. */
   unlimitedHearts: boolean;
+  /**
+   * Show developer tools in Settings — chiefly the ability to conjure a tiny
+   * fixture course. Off by default and never set by the app itself: it exists so
+   * features that only appear on generated content (source provenance, above
+   * all) can be exercised without spending a build to see them.
+   */
+  devMode: boolean;
 }
 
 export const DEFAULT_CONFIG: AppConfig = {
@@ -54,6 +62,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   llmGrading: true,
   dailyGoalXp: 50,
   unlimitedHearts: false,
+  devMode: false,
 };
 
 export interface CourseSummary {
@@ -104,6 +113,7 @@ async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
 export class Store {
   readonly dir: string;
   readonly coursesDir: string;
+  readonly archivesDir: string;
   readonly progressPath: string;
   readonly configPath: string;
 
@@ -116,6 +126,7 @@ export class Store {
   constructor(dir = defaultDataDir()) {
     this.dir = dir;
     this.coursesDir = join(dir, "courses");
+    this.archivesDir = join(dir, "archives");
     this.progressPath = join(dir, "progress.json");
     this.configPath = join(dir, "config.json");
   }
@@ -123,6 +134,7 @@ export class Store {
   async init(): Promise<void> {
     if (this.loaded) return;
     await mkdir(this.coursesDir, { recursive: true });
+    await mkdir(this.archivesDir, { recursive: true });
 
     if (existsSync(this.progressPath)) {
       try {
@@ -205,11 +217,49 @@ export class Store {
     });
   }
 
+  /* ----------------------------- source archives ----------------------------- */
+
+  /**
+   * A course's archived sources, kept beside the course rather than inside it.
+   *
+   * Separate files because the two have opposite shapes: a course is small and
+   * rewritten on every lesson written, an archive is a few hundred kilobytes of
+   * page text that never changes once fetched. Folding them together would mean
+   * rewriting the corpus on every progress tick.
+   */
+  archivePath(courseId: string): string {
+    return join(this.archivesDir, `${courseId}.json`);
+  }
+
+  async getArchives(courseId: string): Promise<ArchivedSource[]> {
+    const path = this.archivePath(courseId);
+    if (!existsSync(path)) return [];
+    try {
+      const raw = JSON.parse(await readFile(path, "utf8"));
+      return Array.isArray(raw) ? (raw as ArchivedSource[]) : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** Replaces any archive already held for the same URL. */
+  async saveArchives(courseId: string, incoming: ArchivedSource[]): Promise<ArchivedSource[]> {
+    return this.queue.run(`archive:${courseId}`, async () => {
+      const existing = await this.getArchives(courseId);
+      const byUrl = new Map(existing.map((a) => [a.url, a]));
+      for (const archive of incoming) byUrl.set(archive.url, archive);
+      const next = [...byUrl.values()];
+      await writeJsonAtomic(this.archivePath(courseId), next);
+      return next;
+    });
+  }
+
   async deleteCourse(id: string): Promise<boolean> {
     const course = this.courses.get(id);
     if (!course) return false;
     this.courses.delete(id);
     await unlink(join(this.coursesDir, `${course.slug}.json`)).catch(() => {});
+    await unlink(this.archivePath(id)).catch(() => {});
 
     // Drop the learner's records for this course too, or progress.json grows forever.
     const lessonIds = new Set(course.units.flatMap((u) => u.lessons.map((l) => l.id)));

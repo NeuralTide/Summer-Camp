@@ -32,6 +32,8 @@ import {
   allowedToolsFor,
   authorLessonsPrompt,
   chatReplyPrompt,
+  tutorReplyPrompt,
+  TUTOR_SYSTEM_PROMPT,
   researchAndPlanPrompt,
   reviseLessonPrompt,
   type ChatTurn,
@@ -246,6 +248,75 @@ export class Builder {
   }
 
   /**
+   * Answer one question about the lesson the learner is reading.
+   *
+   * Runs in the foreground with no tools at all. The learner is waiting on a
+   * couple of sentences, and a tutor that could edit the course would be a
+   * different and much more alarming feature — changing a lesson is what the
+   * report button is for, which goes through `reviseLesson` and says so.
+   */
+  async lessonChat(
+    courseId: string,
+    lessonId: string,
+    turns: ChatTurn[],
+    overrides: { driver?: string; model?: string; effort?: string; turnId?: string } = {},
+  ): Promise<{ text: string; driver: string }> {
+    const course = this.store.getCourse(courseId);
+    if (!course) throw new Error("Unknown course.");
+    const found = findLesson(course, lessonId);
+    if (!found) throw new Error("Unknown lesson.");
+    if (!found.lesson.authored) throw new Error("That lesson has not been written yet.");
+
+    const config = this.store.getConfig();
+    // requireMcp is false here: this call passes no tools, so a driver without
+    // MCP support can still answer questions even though it could not build.
+    const { driver } = await this.registry.resolve(overrides.driver ?? config.driver, { requireMcp: false });
+    const model = overrides.model ?? config.model;
+    const effort = overrides.effort ?? config.effort;
+
+    const claimIds = new Set(found.lesson.citations.map((c) => c.claimId));
+    const result = await driver.run({
+      prompt: tutorReplyPrompt({
+        courseTitle: course.title,
+        lessonTitle: found.lesson.title,
+        objective: found.lesson.objective,
+        notes: found.lesson.notes,
+        // Only the claims this lesson actually rests on. The course's whole
+        // research pile would bury the ones in front of the learner.
+        claims: course.claims.filter((c) => claimIds.has(c.id)).map(({ text, quote }) => ({ text, quote })),
+        turns,
+      }),
+      systemPrompt: TUTOR_SYSTEM_PROMPT,
+      ...(model ? { model } : {}),
+      ...(effort ? { effort } : {}),
+      allowedTools: [],
+      timeoutMs: INTERVIEW_TIMEOUT_MS,
+      /*
+       * Relayed so the learner sees the answer being written instead of a
+       * spinner that says nothing for thirty seconds. Only the two event kinds
+       * that are worth reading are forwarded — usage, exit codes and stderr are
+       * this app's business, not the reader's.
+       *
+       * Fire-and-forget: a dropped delta costs a slightly jumpier reveal, and
+       * the authoritative text is the return value below, so nothing depends on
+       * these arriving.
+       */
+      ...(overrides.turnId
+        ? {
+            onEvent: (event) => {
+              if (event.type !== "text" && event.type !== "reasoning") return;
+              if (!event.text) return;
+              this.bus.emit({ type: "tutor.delta", turnId: overrides.turnId!, kind: event.type, text: event.text });
+            },
+          }
+        : {}),
+    });
+
+    if (!result.ok) throw new Error(result.error ?? `${driver.name} could not answer.`);
+    return { text: result.text.trim(), driver: driver.id };
+  }
+
+  /**
    * Re-check one lesson against a learner's objection, and rewrite it if the
    * objection is right.
    *
@@ -390,6 +461,7 @@ export class Builder {
       color: "#58cc02",
       units: [],
       sources: [],
+      claims: [],
       researchNotes: "",
       createdAt: now,
       updatedAt: now,
@@ -621,33 +693,65 @@ export class Builder {
     /* ------------------------------ Finish ------------------------------ */
     this.setPhase(job, "finishing");
     course = this.store.getCourse(job.courseId)!;
-    const written = authoredLessons(course);
-    const total = totalLessons(course);
 
-    if (written === 0) {
+    if (authoredLessons(course) === 0) {
       return this.failJob(job, "No lessons could be written.");
     }
 
-    const finalStatus = "ready";
+    await this.finishAuthoring(job, initialUnits);
+  }
+
+  /**
+   * Close out an authoring job, recording what it actually managed to write.
+   *
+   * Both the initial build and `resume` end here, because having two copies of
+   * this is what let a course lie about itself: a job whose agent sessions all
+   * died to a usage limit still set the course "ready", cleared the error and
+   * logged nothing alarming, so a course with one lesson of eight was
+   * indistinguishable from a finished one until the learner found the locked
+   * lessons themselves. `authorPass` deliberately swallows a failed session so
+   * one bad unit cannot sink the rest — which means this is the only place left
+   * that can notice the loss.
+   *
+   * @param scopedUnits units this job set out to write, if it was not writing
+   *   the whole course. Unwritten lessons outside that scope were left on
+   *   purpose and are reported as deferred rather than lost.
+   */
+  private async finishAuthoring(job: BuildJob, scopedUnits?: number[]): Promise<void> {
+    const course = this.store.getCourse(job.courseId)!;
+    const written = authoredLessons(course);
+    const total = totalLessons(course);
+    const deferred = scopedUnits ? unwrittenIn(course) - unwrittenIn(course, scopedUnits) : 0;
+    const lost = Math.max(0, total - written - deferred);
+
+    const detail = lost
+      ? `Stopped with ${lost} lesson${lost === 1 ? "" : "s"} unwritten — the agent most likely ran out of context or usage before finishing.`
+      : "";
+
     await this.store.updateCourse(job.courseId, (c) => {
-      const next: Course = { ...c, status: finalStatus };
+      const next: Course = {
+        ...c,
+        status: "ready",
+        lastBuild: { finishedAt: new Date().toISOString(), written, total, deferred, ok: lost === 0, detail },
+      };
       delete next.error;
       return next;
     });
 
+    // The job itself ran to completion either way; it is the course that is
+    // short, and `lastBuild` is what carries that.
     job.phase = "done";
     job.ok = true;
     job.finishedAt = new Date().toISOString();
     this.emitProgress(job);
-    const deferred = initialUnits ? totalLessons(course) - lessonsIn(course, initialUnits) : 0;
     this.log(
       job,
-      "info",
-      written === total
-        ? `Course ready — ${total} lessons.`
-        : deferred > 0 && written + deferred >= total
+      lost ? "warn" : "info",
+      lost
+        ? `Stopped early — ${written} of ${total} lessons written, ${lost} still missing. Continue writing to finish them.`
+        : deferred
           ? `Ready — ${written} lessons now, and the next unit is written when you reach it.`
-          : `Course ready with ${written} of ${total} lessons; the rest stay locked.`,
+          : `Course ready — ${total} lessons.`,
     );
     this.bus.emit({ type: "course.updated", course: summarize(this.store.getCourse(job.courseId)!) });
     this.bus.emit({ type: "build.finished", jobId: job.id, courseId: job.courseId, ok: true });
@@ -761,10 +865,20 @@ export class Builder {
     if (course) {
       // Keep a partially-built course playable rather than discarding the work.
       const salvageable = authoredLessons(course) > 0;
+      // Nothing is deferred by a job that failed: it promised no later pass, so
+      // every unwritten lesson counts as lost and needs offering back.
       await this.store.updateCourse(job.courseId, (c) => ({
         ...c,
         status: salvageable ? "ready" : "failed",
         error: message,
+        lastBuild: {
+          finishedAt: new Date().toISOString(),
+          written: authoredLessons(course),
+          total: totalLessons(course),
+          deferred: 0,
+          ok: false,
+          detail: message,
+        },
       }));
       this.bus.emit({ type: "course.updated", course: summarize(this.store.getCourse(job.courseId)!) });
     }
@@ -870,13 +984,26 @@ export class Builder {
   }
 
   /** Author only the lessons that are still stubs, for an existing course. */
-  async resume(courseId: string, driverId?: string): Promise<Omit<BuildJob, "cancel">> {
+  /**
+   * Write lessons an earlier build left unwritten.
+   *
+   * Defaults to the next unwritten unit rather than the whole remainder, and
+   * that default is the point: the usual reason a course needs resuming is that
+   * writing it all at once exhausted the agent, so offering "all of it again"
+   * as the only way back is offering the thing that just failed. A unit at a
+   * time always fits, and can be run as many times as there are units left.
+   */
+  async resume(courseId: string, opts: { driverId?: string; scope?: "next" | "all" } = {}): Promise<Omit<BuildJob, "cancel">> {
     const course = this.store.getCourse(courseId);
     if (!course) throw new Error("Course not found.");
     if (authoredLessons(course) >= totalLessons(course)) throw new Error("Every lesson is already written.");
 
+    const scope = opts.scope ?? "next";
+    const firstUnwritten = course.units.findIndex((u) => u.lessons.some((l) => !l.authored));
+    const scopedUnits = scope === "next" && firstUnwritten !== -1 ? [firstUnwritten] : undefined;
+
     const config = this.store.getConfig();
-    const { driver } = await this.registry.resolve(driverId ?? config.driver, { requireMcp: true });
+    const { driver } = await this.registry.resolve(opts.driverId ?? config.driver, { requireMcp: true });
 
     const controller = new AbortController();
     const job: BuildJob = {
@@ -914,14 +1041,9 @@ export class Builder {
           workDir,
           controller.signal,
           config.authorConcurrency,
+          scopedUnits,
         );
-        await this.store.updateCourse(courseId, (c) => ({ ...c, status: "ready" }));
-        job.phase = "done";
-        job.ok = true;
-        job.finishedAt = new Date().toISOString();
-        this.emitProgress(job);
-        this.bus.emit({ type: "course.updated", course: summarize(this.store.getCourse(courseId)!) });
-        this.bus.emit({ type: "build.finished", jobId: job.id, courseId, ok: true });
+        await this.finishAuthoring(job, scopedUnits);
       } catch (err) {
         await this.failJob(job, (err as Error).message);
       }
@@ -981,13 +1103,6 @@ async function mapWithConcurrency<T>(
     }
   });
   await Promise.all(runners);
-}
-
-/** Lessons belonging to the given units (all units when undefined). */
-function lessonsIn(course: Course, unitIndices?: number[]): number {
-  if (!unitIndices) return totalLessons(course);
-  const wanted = new Set(unitIndices);
-  return lessonSequence(course).filter((e) => wanted.has(e.unitIndex)).length;
 }
 
 /** Unwritten lessons within the given units (all units when undefined). */

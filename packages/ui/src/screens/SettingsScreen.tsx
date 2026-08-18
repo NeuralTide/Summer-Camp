@@ -1,14 +1,15 @@
 import { useState } from "react";
 import { api } from "../lib/api";
-import type { AppConfig, DriverStatus } from "../lib/types";
+import type { AppConfig, CourseSummary, DriverStatus } from "../lib/types";
 
 interface Props {
   drivers: DriverStatus[];
   config: AppConfig;
   onConfigChange: (config: AppConfig) => void;
+  onOpenCourse: (course: CourseSummary) => void;
 }
 
-export function SettingsScreen({ drivers, config, onConfigChange }: Props) {
+export function SettingsScreen({ drivers, config, onConfigChange, onOpenCourse }: Props) {
   const [customCommand, setCustomCommand] = useState(config.customCommand);
   const [saved, setSaved] = useState(false);
 
@@ -208,7 +209,128 @@ export function SettingsScreen({ drivers, config, onConfigChange }: Props) {
             </span>
           </div>
         </div>
+
+        <div className="card">
+          <div className="eyebrow" style={{ marginBottom: 14 }}>
+            Developer
+          </div>
+
+          <Row
+            label="Developer mode"
+            detail="Adds tools for working on Summer Camp itself. Nothing here affects a normal install."
+            checked={config.devMode}
+            onChange={(v) => patch({ devMode: v })}
+          />
+
+          {config.devMode && <FixtureRow />}
+          {config.devMode && <ProbeRow onOpenCourse={onOpenCourse} />}
+        </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Conjures the smallest course that can demonstrate source provenance: one
+ * unit, one lesson, one exercise, one already-archived source.
+ *
+ * Provenance only shows up on content that has sources behind it, so the only
+ * other way to look at it is to spend a real build — the wrong price for
+ * checking whether a hover outline lands in the right place.
+ */
+/**
+ * Build the smallest course that still runs the real pipeline, on a topic you
+ * type: one unit, one lesson, research on.
+ *
+ * The fixture next to this proves the *display* works, but it is written to
+ * pass — it can never show what a live agent does when the server refuses a
+ * quote it invented. This can, for about the cost of one lesson. The limits are
+ * the server's, not this form's, so it cannot quietly become a full build.
+ */
+function ProbeRow({ onOpenCourse }: { onOpenCourse: (course: CourseSummary) => void }) {
+  const [topic, setTopic] = useState("");
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const start = async () => {
+    const trimmed = topic.trim();
+    if (trimmed.length < 2 || starting) return;
+    setStarting(true);
+    setError(null);
+    try {
+      const { course } = await api.devProbe(trimmed);
+      // Straight to the course, because the build log is the thing worth
+      // watching here — it is where the research calls show up.
+      onOpenCourse(course);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't start the test build.");
+      setStarting(false);
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", gap: 14, alignItems: "flex-start", padding: "10px 0" }}>
+      <span style={{ flex: 1 }}>
+        <div>One-lesson research test</div>
+        <div className="faint" style={{ fontSize: 12.5, marginBottom: 8 }}>
+          Runs a real build on a topic you choose, capped at a single unit and a single lesson, with research on. Watch
+          the build log to see the agent archive its sources, record claims, and get quotes rejected. This spends usage.
+        </div>
+        <input
+          className="input"
+          placeholder="e.g. how noise-cancelling headphones work"
+          value={topic}
+          onChange={(e) => setTopic(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && void start()}
+          disabled={starting}
+        />
+        {error && <div style={{ fontSize: 12.5, marginTop: 6, color: "var(--wrong)" }}>{error}</div>}
+      </span>
+      <button className="btn btn--sm" onClick={start} disabled={starting || topic.trim().length < 2}>
+        {starting ? "Starting…" : "Build"}
+      </button>
+    </div>
+  );
+}
+
+function FixtureRow() {
+  const [state, setState] = useState<"idle" | "working" | "done">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [title, setTitle] = useState("");
+
+  const create = async () => {
+    setState("working");
+    setError(null);
+    try {
+      const res = await api.createFixture();
+      setTitle(res.course.title);
+      setState("done");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Couldn't create the test course.");
+      setState("idle");
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", gap: 14, alignItems: "flex-start", padding: "10px 0" }}>
+      <span style={{ flex: 1 }}>
+        <div>Create source-check test course</div>
+        <div className="faint" style={{ fontSize: 12.5 }}>
+          One lesson, one exercise, one archived source. Its notes contain a word-for-word paragraph, a reworded one,
+          and one that appears in no source — so all three states are visible at once. Costs nothing to make.
+        </div>
+        {state === "done" && (
+          <div className="faint" style={{ fontSize: 12.5, marginTop: 6 }}>
+            Created “{title}” — open it and read the lesson, then hover the paragraphs.
+          </div>
+        )}
+        {error && (
+          <div style={{ fontSize: 12.5, marginTop: 6, color: "var(--wrong)" }}>{error}</div>
+        )}
+      </span>
+      <button className="btn btn--sm" onClick={create} disabled={state === "working"}>
+        {state === "working" ? "Creating…" : state === "done" ? "Create another" : "Create"}
+      </button>
     </div>
   );
 }

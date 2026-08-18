@@ -172,6 +172,7 @@ export default function App() {
             drivers={state.drivers}
             config={state.config}
             onConfigChange={(config) => setState((prev) => (prev ? { ...prev, config } : prev))}
+            onOpenCourse={openCourse}
           />
         )}
 

@@ -21,6 +21,7 @@ export function toStoredUnits(units: PlanUnit[]): Unit[] {
       kind: lesson.kind,
       notes: "",
       exercises: [],
+      citations: [],
       authored: false,
     })),
   }));

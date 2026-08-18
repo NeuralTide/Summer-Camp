@@ -22,6 +22,13 @@ import {
   RULES,
   settleHearts,
   shortId,
+  ClaimSchema,
+  gradeSupport,
+  locateProse,
+  locateQuote,
+  prepareDocument,
+  proseBlocks,
+  provenanceKey,
   slugify,
   SourceSchema,
   summarize,
@@ -33,12 +40,16 @@ import {
   awardXp,
   touchStreak,
   type Answer,
+  type BlockCitation,
+  type Claim,
   type Course,
   type Exercise,
   type GradeResult,
   type Store,
 } from "@metaharness/core";
 import { DriverRegistry } from "@metaharness/harness";
+import { archiveMissing, fetchArchive } from "./archiver.js";
+import { provenanceFixture } from "./fixture.js";
 import { Builder } from "./builder.js";
 import { EventBus } from "./bus.js";
 import { enforceBuildConfig, toStoredUnits } from "./buildConfig.js";
@@ -136,6 +147,7 @@ export function createApp(options: AppOptions): App {
           llmGrading: z.boolean(),
           dailyGoalXp: z.number().int().min(10).max(500),
           unlimitedHearts: z.boolean(),
+          devMode: z.boolean(),
         })
         .partial(),
       body,
@@ -255,9 +267,19 @@ export function createApp(options: AppOptions): App {
 
   router.post("/api/courses/:id/resume", async ({ params, body }) => {
     const course = requireCourse(store, params.id!);
-    const input = parse(z.object({ driver: z.string().optional() }).default({}), body ?? {}, "resume request");
+    const input = parse(
+      z
+        .object({
+          driver: z.string().optional(),
+          /** "next" writes only the next unwritten unit; "all" writes the remainder. */
+          scope: z.enum(["next", "all"]).default("next"),
+        })
+        .default({}),
+      body ?? {},
+      "resume request",
+    );
     try {
-      return { job: await builder.resume(course.id, input.driver) };
+      return { job: await builder.resume(course.id, { driverId: input.driver, scope: input.scope }) };
     } catch (err) {
       throw new HttpError(400, (err as Error).message);
     }
@@ -321,6 +343,7 @@ export function createApp(options: AppOptions): App {
       color: plan.color,
       units: toStoredUnits(plan.units),
       sources: [],
+      claims: [],
       researchNotes: "",
       createdAt: now,
       updatedAt: now,
@@ -369,27 +392,78 @@ export function createApp(options: AppOptions): App {
     return { course: summarize(updated) };
   });
 
+  /**
+   * Record research as *claims*: facts paired with the words in a source that
+   * support them.
+   *
+   * Every quote is checked against the archived page before anything is stored,
+   * and a claim whose quote is not there is refused. That refusal is the only
+   * reason any of this is worth having — the model asserts, and the server is
+   * what decides whether the assertion survives.
+   */
   router.post("/api/courses/:id/research", async ({ params, body }) => {
     const course = requireCourse(store, params.id!);
     const input = parse(
       z.object({
-        notes: z.string().max(20000),
+        notes: z.string().max(20000).default(""),
         sources: z.array(SourceSchema).default([]),
+        claims: z.array(ClaimSchema.omit({ id: true })).default([]),
         append: z.boolean().default(true),
       }),
       body,
       "research note",
     );
 
+    // Sources must be on disk before a quote can be checked against them, so a
+    // note that brings new sources archives them first.
+    const sources = [...course.sources, ...input.sources].slice(0, course.buildConfig.maxSources);
+    let archives = await store.getArchives(course.id);
+    if (input.sources.length) {
+      const fetched = await archiveMissing(sources, archives);
+      if (fetched.length) archives = await store.saveArchives(course.id, fetched);
+    }
+
+    const byUrl = new Map(archives.filter((a) => a.ok).map((a) => [a.url, a]));
+    const accepted: Claim[] = [];
+    const rejected: string[] = [];
+    for (const [i, claim] of input.claims.entries()) {
+      const archive = byUrl.get(claim.sourceUrl);
+      if (!archive) {
+        rejected.push(
+          `claims[${i}]: no archived copy of ${claim.sourceUrl}. Add it in "sources" on this call, or cite one of: ${[...byUrl.keys()].join(", ") || "(none archived yet)"}`,
+        );
+        continue;
+      }
+      const hit = locateQuote(archive.text, claim.quote);
+      if (!hit || hit.kind !== "verbatim") {
+        rejected.push(
+          `claims[${i}]: that quote is not in ${claim.sourceUrl}` +
+            (hit ? ` word for word (closest passage scored ${hit.score}). Quote it exactly as written.` : ". Copy the sentence exactly from the page."),
+        );
+        continue;
+      }
+      accepted.push({ ...claim, id: prefixedId("clm", 8) });
+    }
+
+    if (rejected.length) {
+      throw new HttpError(400, `${rejected.length} of ${input.claims.length} claims were not supported by their source.`, rejected.join("\n"));
+    }
+
     const updated = await store.updateCourse(course.id, (current) => ({
       ...current,
       researchNotes: input.append && current.researchNotes ? `${current.researchNotes}\n\n${input.notes}` : input.notes,
       // Soft cap: sources aren't retried content, so overshooting just gets
       // trimmed to the configured limit rather than rejected outright.
-      sources: [...current.sources, ...input.sources].slice(0, course.buildConfig.maxSources),
+      sources,
+      claims: input.append ? [...current.claims, ...accepted] : accepted,
     }));
     bus.emit({ type: "course.updated", course: summarize(updated) });
-    return { ok: true };
+    return {
+      ok: true,
+      claims: updated.claims.map((c) => ({ id: c.id, text: c.text, sourceUrl: c.sourceUrl })),
+      archived: archives.filter((a) => a.ok).length,
+      unreadable: archives.filter((a) => !a.ok).map((a) => ({ url: a.url, failure: a.failure })),
+    };
   });
 
   router.post("/api/courses/:id/lessons/:lessonId", async ({ params, body }) => {
@@ -406,6 +480,62 @@ export function createApp(options: AppOptions): App {
         `Lesson has ${input.exercises.length} exercises, which is more than the configured limit of ${course.buildConfig.maxExercisesPerLesson}. Trim it down.`,
       );
     }
+
+    /*
+     * Every block of prose must name a claim that backs it.
+     *
+     * Refusing the write is the point rather than a nuisance: a lesson that
+     * ships uncited paragraphs alongside cited ones teaches the reader that the
+     * outline means nothing, and there is then no way to tell "we checked this
+     * and it holds" from "nobody looked". Short blocks, headings, code and
+     * equations are exempt because they carry no claim to check.
+     *
+     * Enforced only once the course actually has claims. A build with
+     * `skipResearch`, and any hand-built course, has none by design — demanding
+     * citations there would reject every lesson and fail the whole build over a
+     * mode the learner deliberately chose. Those courses simply render without
+     * provenance, which is honest: nothing was checked, and nothing claims to
+     * have been.
+     */
+    const known = new Map(course.claims.map((c) => [c.id, c]));
+    const enforceCitations = known.size > 0;
+    const problems: string[] = [];
+    const citations: BlockCitation[] = [];
+    for (const [i, block] of input.blocks.entries()) {
+      for (const claimId of block.cites) {
+        if (!known.has(claimId)) {
+          problems.push(`blocks[${i}].cites: no claim with id "${claimId}". Use ids returned by research_note.`);
+          continue;
+        }
+        // Graded here rather than at read time because this is the only moment
+        // the block's own text and the claim are both in hand, and because the
+        // grade should describe the lesson as written — not drift later if the
+        // grader is retuned.
+        const claim = known.get(claimId)!;
+        for (const prose of proseBlocks(block.markdown)) {
+          const support = gradeSupport(prose, claim);
+          citations.push({ block: provenanceKey(prose), claimId, support: support.level, score: support.score });
+        }
+      }
+      if (block.cites.length > 0 || !enforceCitations) continue;
+      const needsCite = proseBlocks(block.markdown).some((prose) => prose.length >= 40);
+      if (needsCite) {
+        problems.push(
+          `blocks[${i}]: no citation. Every paragraph of prose needs at least one claim id in "cites" — ${JSON.stringify(block.markdown.slice(0, 60))}…`,
+        );
+      }
+    }
+    if (problems.length) {
+      throw new HttpError(
+        400,
+        `This lesson has ${problems.length} block(s) that are not backed by a source.`,
+        `${problems.join("\n")}\n\nAvailable claims:\n${
+          course.claims.map((c) => `  ${c.id} — ${c.text.slice(0, 80)}`).join("\n") || "  (none — call research_note first)"
+        }`,
+      );
+    }
+
+    const notes = input.blocks.map((b) => b.markdown.trim()).join("\n\n");
     // Exercise ids are assigned here, not by the agent: they key SRS cards, so they
     // must be unique and stable regardless of what the model sends.
     const exercises: Exercise[] = input.exercises.map((ex) => ({ ...ex, id: prefixedId("exr", 8) }) as Exercise);
@@ -415,7 +545,7 @@ export function createApp(options: AppOptions): App {
       units: current.units.map((unit) => ({
         ...unit,
         lessons: unit.lessons.map((lesson) =>
-          lesson.id === lessonId ? { ...lesson, notes: input.notes, exercises, authored: true } : lesson,
+          lesson.id === lessonId ? { ...lesson, notes, exercises, citations, authored: true } : lesson,
         ),
       })),
     }));
@@ -468,6 +598,326 @@ export function createApp(options: AppOptions): App {
     } catch (err) {
       throw new HttpError(400, (err as Error).message);
     }
+  });
+
+  /**
+   * Conjure the provenance fixture: one unit, one lesson, one exercise, one
+   * already-archived source. Gated on the developer toggle rather than on a
+   * build flag so it can be reached from a normal install without a rebuild.
+   */
+  router.post("/api/dev/fixture", async () => {
+    if (!store.getConfig().devMode) throw new HttpError(403, "Developer mode is off.");
+    const { course, archive } = provenanceFixture();
+    const saved = await store.saveCourse({ ...course, slug: store.uniqueSlug(course.slug) });
+    await store.saveArchives(saved.id, [archive]);
+    bus.emit({ type: "course.updated", course: summarize(saved) });
+    return { course: summarize(saved) };
+  });
+
+  /**
+   * Fetch, archive, and hand back one source's readable text.
+   *
+   * The text goes back to the agent deliberately: it must quote from the copy
+   * the server will check against, not from whatever its own browser tool saw.
+   * A paywall, a consent wall or an A/B test between the two fetches would
+   * otherwise produce quotes that are perfectly honest and still rejected.
+   */
+  router.post("/api/courses/:id/sources", async ({ params, body }) => {
+    const course = requireCourse(store, params.id!);
+    const input = parse(
+      z.object({
+        url: z.string().url(),
+        title: z.string().trim().min(1).max(300),
+        /** Characters of page text to return. The whole page by default. */
+        limit: z.number().int().min(1000).max(80000).default(40000),
+      }),
+      body,
+      "source",
+    );
+
+    const have = await store.getArchives(course.id);
+    const already = have.find((a) => a.url === input.url && a.ok);
+    const archive = already ?? (await fetchArchive({ title: input.title, url: input.url }));
+    if (!already) await store.saveArchives(course.id, [archive]);
+    if (!archive.ok) throw new HttpError(422, `Could not archive that page: ${archive.failure}`);
+
+    if (!course.sources.some((src) => src.url === input.url)) {
+      const updated = await store.updateCourse(course.id, (current) => ({
+        ...current,
+        sources: [...current.sources, { title: input.title, url: input.url }].slice(0, current.buildConfig.maxSources),
+      }));
+      bus.emit({ type: "course.updated", course: summarize(updated) });
+    }
+
+    return {
+      url: archive.url,
+      chars: archive.text.length,
+      truncated: archive.text.length > input.limit,
+      text: archive.text.slice(0, input.limit),
+    };
+  });
+
+  /**
+   * Build the smallest course that still exercises the real pipeline: one unit,
+   * one lesson, research on.
+   *
+   * The point is to watch `source_add` → `research_note` → `lesson_write` run
+   * against a live agent and see what the citation checks do to real model
+   * output — which no fixture can show, because a fixture is written to pass.
+   *
+   * The limits are applied here rather than accepted from the caller. This
+   * spends real usage, and a "quick test" that quietly grew to six units would
+   * be the most expensive kind of convenience.
+   */
+  router.post("/api/dev/probe", async ({ body }) => {
+    if (!store.getConfig().devMode) throw new HttpError(403, "Developer mode is off.");
+    const input = parse(
+      z.object({
+        topic: z.string().trim().min(2).max(300),
+        level: z.enum(["beginner", "intermediate", "advanced"]).default("beginner"),
+        driver: z.string().optional(),
+        model: z.string().max(120).optional(),
+        effort: z.string().max(40).optional(),
+      }),
+      body,
+      "probe request",
+    );
+
+    try {
+      const { job, course } = await builder.start({
+        ...input,
+        curation: "auto",
+        buildConfig: BuildConfigSchema.parse({
+          maxUnits: 1,
+          maxLessonsPerUnit: 1,
+          maxSources: 3,
+          maxExercisesPerLesson: 3,
+          skipResearch: false,
+          authorAhead: 0,
+        }),
+      });
+      return { job, course: summarize(course) };
+    } catch (err) {
+      throw new HttpError(400, (err as Error).message);
+    }
+  });
+
+  /**
+   * One turn of the lesson tutor: a question about the lesson being read.
+   *
+   * Deliberately stateless. The client holds the transcript and sends it back
+   * each turn, which is how the interview works too — no driver here is
+   * guaranteed to support resuming a session, and a conversation about one
+   * lesson is small enough that resending it costs almost nothing.
+   */
+  router.post("/api/courses/:id/lessons/:lessonId/chat", async ({ params, body }) => {
+    const course = requireCourse(store, params.id!);
+    const input = parse(
+      z.object({
+        turns: z
+          .array(z.object({ role: z.enum(["user", "assistant"]), text: z.string().trim().min(1).max(8000) }))
+          .min(1)
+          .max(40),
+        driver: z.string().optional(),
+        model: z.string().max(120).optional(),
+        effort: z.string().max(40).optional(),
+        /** Client-generated, so a tab can pick its own reply out of the bus. */
+        turnId: z.string().max(64).optional(),
+      }),
+      body,
+      "chat request",
+    );
+
+    try {
+      return await builder.lessonChat(course.id, params.lessonId!, input.turns, {
+        ...(input.driver ? { driver: input.driver } : {}),
+        ...(input.model !== undefined ? { model: input.model } : {}),
+        ...(input.effort !== undefined ? { effort: input.effort } : {}),
+        ...(input.turnId ? { turnId: input.turnId } : {}),
+      });
+    } catch (err) {
+      throw new HttpError(400, (err as Error).message);
+    }
+  });
+
+  /* --------------------------- source provenance --------------------------- */
+
+  /**
+   * Fetch and keep the pages this course cites.
+   *
+   * Separate from building on purpose: a course generated long before any of
+   * this existed can be archived now and gets provenance retroactively, and
+   * archiving costs nothing but bandwidth — no agent, no model, no usage.
+   */
+  router.post("/api/courses/:id/archive", async ({ params }) => {
+    const course = requireCourse(store, params.id!);
+    const have = await store.getArchives(course.id);
+    const fetched = await archiveMissing(course.sources, have);
+    const archives = fetched.length ? await store.saveArchives(course.id, fetched) : have;
+    return {
+      archived: archives.filter((a) => a.ok).length,
+      failed: archives.filter((a) => !a.ok).map((a) => ({ title: a.title, url: a.url, failure: a.failure })),
+      total: course.sources.length,
+    };
+  });
+
+  router.get("/api/courses/:id/archives", async ({ params }) => {
+    const course = requireCourse(store, params.id!);
+    // Text is omitted here; it is large and only the viewer needs it.
+    const archives = await store.getArchives(course.id);
+    return {
+      archives: archives.map(({ text, ...rest }) => ({ ...rest, length: text.length })),
+    };
+  });
+
+  /** The archived page itself, for the viewer to render and highlight. */
+  router.get("/api/courses/:id/archives/:sourceId", async ({ params }) => {
+    const course = requireCourse(store, params.id!);
+    const archive = (await store.getArchives(course.id)).find((a) => a.id === params.sourceId);
+    if (!archive) throw new HttpError(404, "No archived copy of that source.");
+    return archive;
+  });
+
+  /**
+   * Which blocks of a lesson's notes can be found in the course's sources.
+   *
+   * Computed per request rather than stored: it is pure string matching over
+   * text already on disk, it costs single-digit milliseconds, and caching it
+   * would mean invalidating on every re-archive and every lesson revision.
+   */
+  /**
+   * Where each block of a lesson's notes comes from.
+   *
+   * Two sources of truth, and they are not equal. A *cited* block was declared
+   * by the author and its quote proven to exist in the archive at write time. A
+   * *guessed* block is this app matching strings after the fact on a course
+   * built before citations existed — useful, but an inference, and labelled as
+   * one so the reader is never shown a guess dressed as a citation.
+   */
+  router.get("/api/courses/:id/lessons/:lessonId/provenance", async ({ params }) => {
+    const course = requireCourse(store, params.id!);
+    const found = findLesson(course, params.lessonId!);
+    if (!found) throw new HttpError(400, "No such lesson in this course.");
+    const archives = await store.getArchives(course.id);
+    const claims = new Map(course.claims.map((c) => [c.id, c]));
+    const byUrl = new Map(archives.map((a) => [a.url, a]));
+    /*
+     * Paragraph text by key, so a citation written before grading existed can be
+     * graded now instead of defaulting to the humblest label.
+     *
+     * Grading normally happens once, at write time, so the grade describes the
+     * lesson as written and cannot be silently rewritten later by a retuned
+     * grader. That reasoning does not reach a citation that was never graded at
+     * all: there is no recorded judgement to protect, and leaving it at the
+     * schema default means a course full of real, verified citations displays as
+     * if nobody had checked anything. So they are measured here, on read, and
+     * every course built in the window before grading fixes itself the next time
+     * a lesson is opened — with no rebuild and no model.
+     */
+    const proseByKey = new Map(proseBlocks(found.lesson.notes).map((prose) => [provenanceKey(prose), prose]));
+
+    const cited = found.lesson.citations
+      .flatMap((citation) => {
+        const claim = claims.get(citation.claimId);
+        const archive = claim ? byUrl.get(claim.sourceUrl) : undefined;
+        if (!claim || !archive) return [];
+
+        // A stored grade wins; an ungraded citation is measured from the text
+        // still on disk. A grade of exactly 0 is a real measurement, so the test
+        // is on the field being absent, not on it being falsy.
+        const prose = proseByKey.get(citation.block);
+        const graded =
+          citation.support === undefined || citation.score === undefined
+            ? prose
+              ? (({ level, score }) => ({ support: level, score }))(gradeSupport(prose, claim))
+              : { support: "asserted" as const, score: 0 }
+            : { support: citation.support, score: citation.score };
+
+        return [{
+          key: citation.block,
+          verified: true as const,
+          claimId: claim.id,
+          quote: claim.quote,
+          sourceId: archive.id,
+          sourceTitle: archive.title,
+          sourceUrl: archive.url,
+          hasDocument: Boolean(archive.html),
+          // How well the paragraph's wording follows the claim. Never assumed: a
+          // paragraph that merely points at a claim is a weaker thing than one
+          // that quotes it, and the reader is owed the difference.
+          ...graded,
+        }];
+      })
+      // Strongest first, so a paragraph resting on several claims is represented
+      // by its best-supported one rather than by whichever was listed last.
+      .sort((a, b) => b.score - a.score);
+
+    // Only fall back when the lesson declared nothing — mixing a guess into a
+    // cited lesson would make the outline mean two different things at once.
+    const blocks = cited.length
+      ? cited
+      : locateProse(found.lesson.notes, archives).map((hit) => ({
+          ...hit,
+          verified: false as const,
+          claimId: null,
+          quote: null,
+          hasDocument: Boolean(byUrl.get(hit.sourceUrl)?.html),
+          // A guess reports the same two fields so the viewer has one shape to
+          // render; `verified: false` is what keeps the two from being confused.
+          support: hit.kind === "verbatim" ? ("quoted" as const) : ("restated" as const),
+        }));
+
+    const citedKeys = new Set(blocks.map((b) => b.key));
+    return {
+      blocks,
+      verified: cited.length > 0,
+      /*
+       * The denominator for "n of m paragraphs cited", and it has to count the
+       * same population the numerator does or it can be exceeded — a lesson
+       * citing short list items reported 8 of 5, which is the same species of
+       * nonsense as double-counting a paragraph.
+       *
+       * A paragraph counts if it is substantial enough to need a source, OR if
+       * the author vouched for it whatever its length. That keeps headings and
+       * one-line connectives out of the count while keeping every marked-up
+       * item in it, and makes the numerator a subset by construction.
+       */
+      proseCount: proseBlocks(found.lesson.notes).filter(
+        (b) => b.length >= 40 || citedKeys.has(provenanceKey(b)),
+      ).length,
+      archived: archives.filter((a) => a.ok).length,
+      sourceCount: course.sources.length,
+    };
+  });
+
+  /**
+   * The archived page itself, as a document — scripts stripped, assets pointed
+   * back at the origin, the cited passage wrapped in <mark id="mh-cited">.
+   *
+   * Served as HTML rather than JSON because it is loaded into a sandboxed
+   * iframe, and delivered with a fragment target so the browser scrolls to the
+   * highlight without any script running inside the frame.
+   */
+  router.get("/api/courses/:id/archives/:sourceId/document", async ({ params, query, res }) => {
+    const course = requireCourse(store, params.id!);
+    const archive = (await store.getArchives(course.id)).find((a) => a.id === params.sourceId);
+    if (!archive) throw new HttpError(404, "No archived copy of that source.");
+    if (!archive.html) throw new HttpError(409, "This source was archived without its markup.");
+
+    const claim = course.claims.find((c) => c.id === query.get("claim"));
+    const quote = claim?.quote ?? query.get("quote") ?? undefined;
+    const { html, highlighted } = prepareDocument(archive, quote ?? undefined);
+
+    res.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "x-highlighted": highlighted ? "1" : "0",
+      // The document is third-party markup; keep it from being framed anywhere
+      // but here, and from being sniffed into something else.
+      "x-content-type-options": "nosniff",
+      "cache-control": "no-store",
+    });
+    res.end(html);
+    return SENT;
   });
 
   router.get("/api/courses/:id/progress", () => {

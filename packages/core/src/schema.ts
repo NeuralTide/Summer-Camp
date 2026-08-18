@@ -295,6 +295,33 @@ export const REVIEWABLE_TYPES = new Set<ExerciseType>(EXERCISE_TYPES);
 export const LessonKindSchema = z.enum(["concept", "practice", "checkpoint"]);
 export type LessonKind = z.infer<typeof LessonKindSchema>;
 
+/**
+ * Which claim backs which block of a lesson's notes.
+ *
+ * `support` records how closely the block's wording actually follows the claim,
+ * measured by the server at write time (see `gradeSupport`). It exists because
+ * this half of the provenance chain is the model's assertion — the claim's quote
+ * was checked against the archived page, but nothing checks that the paragraph
+ * pointing at it says what it says. Grading it is what keeps a linked-but-
+ * unquoted paragraph from being displayed as though it were quoted.
+ *
+ * Both grade fields are optional rather than defaulted, and that distinction
+ * carries weight: absent means *nobody measured this*, which is not the same as
+ * measuring it and finding nothing. Defaulting them would collapse the two, and
+ * a course written before grading existed would be indistinguishable from one
+ * whose every citation had been examined and found wanting. Left absent, the
+ * reader can grade it on the way past instead.
+ */
+export const BlockCitationSchema = z.object({
+  /** provenanceKey of the block — derived by the server, never sent by an agent. */
+  block: z.string(),
+  claimId: z.string(),
+  support: z.enum(["quoted", "restated", "asserted"]).optional(),
+  /** Fraction of the block's significant words found in the cited material. */
+  score: z.number().min(0).max(1).optional(),
+});
+export type BlockCitation = z.infer<typeof BlockCitationSchema>;
+
 export const LessonSchema = z.object({
   id: z.string().default(""),
   title: nonEmpty("lesson.title", 120),
@@ -303,6 +330,8 @@ export const LessonSchema = z.object({
   /** Markdown taught before the exercises begin. Supports $math$ and ```code fences. */
   notes: z.string().max(8000).default(""),
   exercises: z.array(ExerciseSchema).default([]),
+  /** Verified citations, one per (block, claim) pair. Empty on hand-written lessons. */
+  citations: z.array(BlockCitationSchema).default([]),
   authored: z.boolean().default(false).describe("False while the lesson is still a planned stub"),
 });
 export type Lesson = z.infer<typeof LessonSchema>;
@@ -314,6 +343,27 @@ export const UnitSchema = z.object({
   lessons: z.array(LessonSchema).min(1),
 });
 export type Unit = z.infer<typeof UnitSchema>;
+
+/**
+ * One fact, tied to the exact words in a source that support it.
+ *
+ * The pairing is the whole design. `text` is the agent's own phrasing — what it
+ * will actually build a lesson from — and `quote` is the span from the archived
+ * page it is answerable to. The server checks the quote is really there before
+ * accepting the claim, so by the time anything is authored, every fact in the
+ * research pile has already been proven to exist in a document on disk.
+ */
+export const ClaimSchema = z.object({
+  id: z.string().default(""),
+  text: nonEmpty("claim.text", 600).describe("The fact, in your own words"),
+  sourceUrl: z.string().describe("URL of an already-archived source"),
+  quote: z
+    .string()
+    .min(20, "A quote needs to be long enough to identify — 20 characters or more.")
+    .max(600)
+    .describe("Word-for-word from the source. Checked against the archived page; invented quotes are rejected."),
+});
+export type Claim = z.infer<typeof ClaimSchema>;
 
 export const SourceSchema = z.object({
   title: nonEmpty("source.title", 300),
@@ -374,6 +424,36 @@ export const BuildConfigSchema = z.object({
 });
 export type BuildConfig = z.infer<typeof BuildConfigSchema>;
 
+/**
+ * What the last build actually accomplished.
+ *
+ * A build can stop short for two very different reasons, and a course that
+ * stopped short looks exactly like a finished one from the outside: the whole
+ * outline is there, and some of the lessons are written. Recording the outcome
+ * is what lets the app tell the learner which of these happened —
+ *
+ *  - `deferred` lessons were left unwritten *on purpose*, because the course
+ *    writes just ahead of the reader (see `BuildConfig.authorAhead`). Nothing
+ *    is wrong and nothing needs doing.
+ *  - anything unwritten beyond those was *lost*: the agent hit its context or
+ *    usage limit, timed out, or errored, and those lessons need writing again.
+ *
+ * Kept on the course rather than in the job log because jobs live in memory and
+ * the question "did this finish?" outlives the process that built it.
+ */
+export const BuildOutcomeSchema = z.object({
+  finishedAt: z.string(),
+  /** Lessons written across the whole course at the moment the job ended. */
+  written: z.number().int().min(0).default(0),
+  total: z.number().int().min(0).default(0),
+  /** Unwritten lessons the build deliberately left for later. */
+  deferred: z.number().int().min(0).default(0),
+  /** False when the job failed outright; a job can also end ok having lost lessons. */
+  ok: z.boolean().default(true),
+  detail: z.string().max(600).default(""),
+});
+export type BuildOutcome = z.infer<typeof BuildOutcomeSchema>;
+
 export const CourseSchema = z.object({
   id: z.string(),
   slug: z.string(),
@@ -388,10 +468,12 @@ export const CourseSchema = z.object({
   color: z.string().regex(/^#[0-9a-fA-F]{6}$/).default("#769826"),
   units: z.array(UnitSchema).default([]),
   sources: z.array(SourceSchema).default([]),
+  claims: z.array(ClaimSchema).default([]),
   researchNotes: z.string().max(20000).default(""),
   createdAt: z.string(),
   updatedAt: z.string(),
   error: z.string().optional(),
+  lastBuild: BuildOutcomeSchema.optional(),
 });
 export type Course = z.infer<typeof CourseSchema>;
 
@@ -423,8 +505,19 @@ export const CoursePlanSchema = z.object({
 });
 export type CoursePlan = z.infer<typeof CoursePlanSchema>;
 
+/**
+ * A lesson arrives as blocks rather than one markdown string, because a
+ * citation has to attach to something smaller than the whole lesson to be worth
+ * anything. The server joins the blocks back into `notes` for rendering and
+ * keeps the citations keyed by block.
+ */
+export const LessonBlockSchema = z.object({
+  markdown: nonEmpty("block.markdown", 2000),
+  cites: z.array(z.string()).default([]).describe("Claim ids from research_note that back this block"),
+});
+
 export const LessonWriteSchema = z.object({
-  notes: z.string().max(8000).default(""),
+  blocks: z.array(LessonBlockSchema).min(1).max(30),
   exercises: z.array(ExerciseSchema).min(3).max(12),
 });
 export type LessonWrite = z.infer<typeof LessonWriteSchema>;
@@ -449,6 +542,21 @@ export function totalLessons(course: Course): number {
 
 export function authoredLessons(course: Course): number {
   return course.units.reduce((n, u) => n + u.lessons.filter((l) => l.authored).length, 0);
+}
+
+/**
+ * Lessons the last build was supposed to write and didn't.
+ *
+ * Unwritten lessons are normal — a course writes just ahead of the reader — so
+ * the count that matters is the unwritten ones the build did *not* mean to
+ * leave. Without a recorded outcome we cannot tell the two apart, and the safe
+ * assumption is the quiet one: a course nobody has built yet is not "broken",
+ * and `resume` is offered on unwritten lessons regardless.
+ */
+export function lostLessons(course: Course): number {
+  if (!course.lastBuild) return 0;
+  const unwritten = totalLessons(course) - authoredLessons(course);
+  return Math.max(0, unwritten - course.lastBuild.deferred);
 }
 
 export function findLesson(course: Course, lessonId: string): { unit: Unit; lesson: Lesson } | undefined {

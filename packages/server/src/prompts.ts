@@ -36,7 +36,9 @@ export interface ResearchPromptInput {
 export function researchAndPlanPrompt(input: ResearchPromptInput): string {
   const { buildConfig } = input;
   const research = input.hasWebSearch
-    ? `1. RESEARCH. Search the web to ground the course in accurate specifics. You are looking for: the standard way this subject is broken down and sequenced; the precise definitions, formulas and numbers you will need; worked examples; and — most valuable of all — the mistakes and misconceptions beginners actually have, because those become your distractors. Prefer primary and authoritative sources. Record at most ${buildConfig.maxSources} sources — pick the best ones, not the most.`
+    ? `1. RESEARCH. Search the web to ground the course in accurate specifics. You are looking for: the standard way this subject is broken down and sequenced; the precise definitions, formulas and numbers you will need; worked examples; and — most valuable of all — the mistakes and misconceptions beginners actually have, because those become your distractors. Prefer primary and authoritative sources. Record at most ${buildConfig.maxSources} sources — pick the best ones, not the most.
+
+For each page you intend to use, call \`source_add\` with its URL. That archives the page and returns its text; the learner can later open that archived copy and see exactly which sentence a lesson came from. Quote from the text \`source_add\` returns, not from your browser — the server checks every quote against its own copy and rejects any it cannot find.`
     : `1. RESEARCH. Web search is unavailable, so work from your own knowledge. Be conservative: prefer well-established material you are confident is correct over specifics you might be misremembering. Do not invent citations, statistics, or numbers you are unsure of.`;
 
   const unitCap = Math.max(1, buildConfig.maxUnits - 2);
@@ -51,7 +53,11 @@ Work in three steps.
 
 ${research}
 
-2. RECORD what you found by calling \`research_note\`. Write down the concrete material you will need when authoring lessons — definitions, formulas, numbers, worked examples, common misconceptions — not a summary of your reading. You will be given these notes back when you write the individual lessons, and you will not have your search results then. Include your sources.
+2. RECORD what you found by calling \`research_note\` with a list of CLAIMS. Each claim pairs a fact in your own words with the exact sentence from an archived page that supports it. Gather the concrete material you will need when authoring — definitions, formulas, numbers, worked examples, common misconceptions — not a summary of your reading; you will not have your search results when you write the lessons, only these claims.
+
+Every quote is verified against the archived page before the call succeeds. A rejected claim tells you the closest passage it found, so fix the quote and retry. A fact you cannot support with a quote is one you should not teach.
+
+\`research_note\` returns an id for each claim. Those ids are what \`lesson_write\` requires to cite each paragraph, so gather enough claims to cover everything you plan to say.
 
 3. PLAN the course by calling \`course_plan\` exactly once.
 
@@ -98,9 +104,22 @@ YOUR ASSIGNED LESSONS:
 ${assignment}
 
 ${course.researchNotes ? `RESEARCH NOTES gathered for this course:\n${course.researchNotes}\n` : ""}
+${
+    course.claims.length
+      ? `VERIFIED CLAIMS. Each was checked against an archived source when it was recorded, and its id is what you cite. You may only teach from these — write the lesson out of the claims you have, and cite the ones each paragraph rests on.
+
+${course.claims
+          .map((c) => `${c.id}  ${c.text}`)
+          .join("\n")}\n`
+      : ""
+  }
 For each assigned lesson, call \`lesson_write\` once.
 
-NOTES (120-250 words of markdown): teach the idea. Open with the intuition in plain language, give the precise statement, then a concrete example with real numbers. Use $inline$ and $$display$$ math and \`\`\`fenced\`\`\` code where they help. Do not write "In this lesson we will learn..." — just teach.
+BLOCKS (120-250 words of markdown, split one block per paragraph/list/heading/equation): teach the idea. Open with the intuition in plain language, give the precise statement, then a concrete example with real numbers. Use $inline$ and $$display$$ math and \`\`\`fenced\`\`\` code where they help. Do not write "In this lesson we will learn..." — just teach.
+
+CITE every block of prose: put the claim ids it rests on in that block's \`cites\`. A paragraph with nothing to cite is a paragraph you are making up — cut it, or go back and research it. The call is rejected if any prose block is uncited, and it names the blocks so you can fix them.
+
+Cite what a paragraph actually rests on rather than the nearest plausible claim. The server measures how much of the paragraph's wording the claim accounts for, and the learner sees that grade next to the source — a loose pairing shows up as unsupported. If a paragraph covers two claims, cite both; if it drifts away from all of them, it is a paragraph you have not earned.
 
 EXERCISES (${minExercises}-${maxExercises} per lesson — ${maxExercises} is a hard cap, the write will be rejected above it): answerable from your notes alone, ordered easy to hard, and mixed across types. Use \`multiple_choice\` and \`true_false\` for recognition; \`fill_blank\` and \`short_answer\` for recall; \`match_pairs\`, \`categorize\` and \`order_sequence\` for structural understanding. A \`checkpoint\` lesson should test the whole unit and lean harder.
 
@@ -211,6 +230,7 @@ export function allowedToolsFor(stage: "plan" | "author" | "revise", hasWebSearc
   const mcp = [
     "mcp__metaharness__course_get",
     "mcp__metaharness__progress_get",
+    "mcp__metaharness__source_add",
     "mcp__metaharness__research_note",
     "mcp__metaharness__course_plan",
     "mcp__metaharness__lesson_write",
@@ -286,6 +306,77 @@ When you have everything, emit the finished setup instead:
 - Your prose in that final message should say what you are about to build, in a sentence. They still have to press the button.
 
 Do not call any tools. Reply with prose plus the one control block, nothing else.`;
+
+/* ------------------------------------------------------------------ */
+/* Asking about the lesson you are reading                             */
+/* ------------------------------------------------------------------ */
+
+export const TUTOR_SYSTEM_PROMPT = `You are a tutor sitting beside someone who is part-way through a lesson. They have stopped to ask you something.
+
+You are not the author of this lesson and you are not defending it. You are the person they turn to when a sentence did not land.
+
+HOW TO ANSWER
+- Answer the question that was asked. Do not restate the lesson at them.
+- Short. Two or three sentences unless they asked for a walkthrough. This is a conversation in a side panel, not an essay.
+- Plain language first, then the precise version. Give a concrete example with real numbers wherever one exists.
+- If they are confused, find the specific thing they are confused about rather than explaining the whole topic again.
+- You may go beyond the lesson — related ideas, worked examples, what comes next — that is what a tutor is for.
+
+WHAT YOU MUST NOT DO
+- Do not invent facts, numbers, dates, or citations. If you do not know, say so.
+- The lesson's sourced material is given to you below. When you answer from something outside it, do not present it as though it came from the lesson's sources.
+- If the learner says the lesson is wrong and they may be right, say so plainly rather than smoothing it over. Tell them the lesson can be reported with the flag button, which puts an agent onto checking it properly.
+- Never answer an exercise for them outright. If they are stuck on a question, ask what they have tried, or point at the idea it turns on. They are here to learn it, not to be handed it.
+
+Markdown is rendered. Use $inline$ and $$display$$ maths and fenced code blocks where they help.`;
+
+/**
+ * One turn of the lesson tutor.
+ *
+ * The lesson's notes go out in full and its verified claims go with them, which
+ * is the whole reason this is worth having over a general chat window: the
+ * tutor's picture of the subject is the same material the learner is reading,
+ * and the claims carry the passages that were checked against real sources. It
+ * still has the model's own knowledge to draw on — a tutor that can only recite
+ * the lesson is no use when the lesson is what confused you — so the prompt
+ * separates the two and asks it not to dress one up as the other.
+ */
+export function tutorReplyPrompt(input: {
+  courseTitle: string;
+  lessonTitle: string;
+  objective: string;
+  notes: string;
+  claims: Array<{ text: string; quote: string }>;
+  turns: ChatTurn[];
+}): string {
+  const transcript = input.turns
+    .map((t) => (t.role === "user" ? `LEARNER: ${t.text}` : `YOU: ${t.text}`))
+    .join("\n\n");
+
+  const sourced = input.claims.length
+    ? `SOURCED MATERIAL behind this lesson. Each was checked word for word against a real document, so you can rely on these:\n${input.claims
+        .map((c) => `- ${c.text}\n  "${c.quote}"`)
+        .join("\n")}\n`
+    : "";
+
+  return `The learner is reading this lesson:
+
+COURSE: ${input.courseTitle}
+LESSON: ${input.lessonTitle}
+WHAT IT IS FOR: ${input.objective}
+
+THE LESSON TEXT they are looking at:
+${input.notes}
+
+${sourced}
+---
+
+${transcript}
+
+---
+
+Reply to the learner's last message. Your next message only.`;
+}
 
 export interface ChatTurn {
   role: "user" | "assistant";

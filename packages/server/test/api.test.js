@@ -212,7 +212,7 @@ test("the MCP authoring path plans a course and writes a lesson", async (t) => {
   assert.ok(lessonId, "the agent is handed a generated lesson id");
 
   const write = await ctx.call("POST", `/api/courses/${created.id}/lessons/${lessonId}`, {
-    notes: "Tides are caused by the Moon's gravitational gradient across the Earth.",
+    blocks: [{ markdown: "Tides are caused by the Moon's gravitational gradient across the Earth.", cites: [] }],
     exercises: [
       {
         type: "multiple_choice",

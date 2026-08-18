@@ -5,3 +5,4 @@ export * from "./srs.js";
 export * from "./progress.js";
 export * from "./session.js";
 export * from "./store.js";
+export * from "./archive.js";

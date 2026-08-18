@@ -15,6 +15,8 @@ export interface BuildConfig {
   maxSources: number;
   maxExercisesPerLesson: number;
   skipResearch: boolean;
+  /** Units kept written ahead of the learner; 0 writes the whole course up front. */
+  authorAhead?: number;
 }
 
 export interface PlanLesson {
@@ -27,6 +29,60 @@ export interface PlanUnit {
   title: string;
   description: string;
   lessons: PlanLesson[];
+}
+
+/** What the last build managed to write — see BuildOutcomeSchema in core. */
+export interface BuildOutcome {
+  finishedAt: string;
+  written: number;
+  total: number;
+  /** Unwritten lessons the build meant to leave for later, not lost ones. */
+  deferred: number;
+  ok: boolean;
+  detail: string;
+}
+
+export type CitationKind = "verbatim" | "paraphrase";
+
+export type SupportLevel = "quoted" | "restated" | "asserted";
+
+/**
+ * One block of lesson prose tied to a source.
+ *
+ * `verified` separates the two ways a block can get here: declared by the author
+ * and proven against the archive at write time, or matched by this app after the
+ * fact on a course built before citations existed. They are never shown alike.
+ */
+export interface BlockProvenance {
+  key: string;
+  verified: boolean;
+  claimId: string | null;
+  quote: string | null;
+  sourceId: string;
+  sourceTitle: string;
+  sourceUrl: string;
+  hasDocument: boolean;
+  /**
+   * How closely this paragraph's wording follows the material it cites —
+   * measured, not assumed. `verified` says whether a human-authored citation
+   * exists; this says how much that citation is worth.
+   */
+  support: SupportLevel;
+  kind?: CitationKind;
+  score: number;
+  /** Offsets into the extracted text — only present on unverified matches. */
+  start?: number;
+  end?: number;
+}
+
+export interface ArchivedSource {
+  id: string;
+  url: string;
+  title: string;
+  fetchedAt: string;
+  text: string;
+  ok: boolean;
+  failure?: string;
 }
 
 export interface CourseSummary {
@@ -69,6 +125,7 @@ export interface CourseTree extends CourseSummary {
   units: UnitStub[];
   researchNotes: string;
   sources: Array<{ title: string; url?: string; note?: string }>;
+  lastBuild?: BuildOutcome;
 }
 
 export interface LessonNode {
@@ -140,6 +197,8 @@ export interface AppConfig {
   llmGrading: boolean;
   dailyGoalXp: number;
   unlimitedHearts: boolean;
+  /** Reveals the developer tools in Settings. */
+  devMode: boolean;
 }
 
 export interface BuildLogEntry {
@@ -251,7 +310,9 @@ export type AppEvent =
   | { type: "build.progress"; jobId: string; courseId: string; authored: number; total: number; phase: BuildPhase }
   | { type: "build.finished"; jobId: string; courseId: string; ok: boolean; error?: string }
   | { type: "progress.updated" }
-  | { type: "grade.updated"; exerciseId: string; correct: boolean; score: number; feedback: string };
+  | { type: "grade.updated"; exerciseId: string; correct: boolean; score: number; feedback: string }
+  /** The tutor mid-answer — see the AppEvent union in the server's bus.ts. */
+  | { type: "tutor.delta"; turnId: string; kind: "reasoning" | "text"; text: string };
 
 /* ------------------------------------------------------------------ */
 /* Course setup interview                                              */

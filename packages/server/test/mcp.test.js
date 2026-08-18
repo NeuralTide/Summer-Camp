@@ -78,11 +78,18 @@ test("the MCP server exposes the authoring toolset", async (t) => {
     "lesson_write",
     "progress_get",
     "research_note",
+    "source_add",
   ]);
 
   const write = tools.find((tool) => tool.name === "lesson_write");
   assert.ok(write.inputSchema.properties.exercises, "lesson_write advertises its exercise schema");
+  assert.ok(write.inputSchema.properties.blocks, "and takes notes as citable blocks, not one string");
   assert.ok(/4-8/.test(write.description), "the description carries the authoring brief");
+
+  // The quote is what the server checks a claim against, so the tool has to ask
+  // for it explicitly rather than leaving the agent to volunteer one.
+  const research = tools.find((tool) => tool.name === "research_note");
+  assert.ok(research.inputSchema.properties.claims, "research_note collects claims");
 });
 
 test("an agent can plan, recover from a bad write, and publish", async (t) => {
@@ -116,7 +123,7 @@ test("an agent can plan, recover from a bad write, and publish", async (t) => {
     name: "lesson_write",
     arguments: {
       lessonId,
-      notes: "Chlorophyll absorbs red and blue light.",
+      blocks: [{ markdown: "Chlorophyll absorbs red and blue light.", cites: [] }],
       exercises: [
         { type: "multiple_choice", prompt: "Which colour is reflected?", choices: ["Green", "Red"], answer: "Greenish" },
         { type: "true_false", prompt: "Chlorophyll absorbs blue light.", answer: true },
@@ -131,7 +138,7 @@ test("an agent can plan, recover from a bad write, and publish", async (t) => {
     name: "lesson_write",
     arguments: {
       lessonId,
-      notes: "Chlorophyll absorbs red and blue light, reflecting green.",
+      blocks: [{ markdown: "Chlorophyll absorbs red and blue light, reflecting green.", cites: [] }],
       exercises: [
         {
           type: "multiple_choice",
@@ -170,7 +177,9 @@ test("research notes reach the course and survive to the authoring pass", async 
     name: "research_note",
     arguments: {
       notes: "Chlorophyll a peaks at 430 nm and 662 nm.",
-      sources: [{ title: "Plant Physiology", url: "https://example.org/chlorophyll" }],
+      // .invalid never resolves, so this records an unreachable source without
+      // reaching the network — a test must not depend on someone else's uptime.
+      sources: [{ title: "Plant Physiology", url: "https://example.invalid/chlorophyll" }],
       append: true,
     },
   });

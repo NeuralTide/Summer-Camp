@@ -10,7 +10,17 @@ export type AppEvent =
   | { type: "build.progress"; jobId: string; courseId: string; authored: number; total: number; phase: BuildPhase }
   | { type: "build.finished"; jobId: string; courseId: string; ok: boolean; error?: string }
   | { type: "progress.updated" }
-  | { type: "grade.updated"; exerciseId: string; correct: boolean; score: number; feedback: string };
+  | { type: "grade.updated"; exerciseId: string; correct: boolean; score: number; feedback: string }
+  /**
+   * The tutor, mid-answer. `kind` separates the model's own working-out from the
+   * reply it is composing, because they are not the same promise: the reply is
+   * what it stands behind, and the reasoning is scaffolding it may discard.
+   *
+   * Scoped by a client-generated `turnId` rather than by lesson: the bus is
+   * broadcast, and two tabs open on the same lesson must not pour their answers
+   * into each other.
+   */
+  | { type: "tutor.delta"; turnId: string; kind: "reasoning" | "text"; text: string };
 
 export type BuildPhase = "starting" | "researching" | "planning" | "authoring" | "finishing" | "done" | "failed";
 

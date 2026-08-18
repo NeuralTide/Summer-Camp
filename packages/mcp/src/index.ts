@@ -56,7 +56,7 @@ const server = new McpServer(
   {
     instructions:
       "Tools for authoring an interactive, Duolingo-style course. Typical flow: " +
-      "course_get to see your assignment → research_note to record sources → " +
+      "course_get to see your assignment → source_add for each page → research_note to record verified claims → " +
       "course_plan to lay out units and lessons → lesson_write for each lesson → course_status when finished.",
   },
 );
@@ -175,27 +175,85 @@ server.registerTool(
 );
 
 server.registerTool(
+  "source_add",
+  {
+    title: "Archive a source page",
+    description:
+      "Fetch a page, keep a permanent copy of it on the course, and return its readable text.\n\n" +
+      "Call this for every page you intend to cite, BEFORE research_note. The text returned is the copy the server will " +
+      "check your quotes against, so quote from what this returns rather than from your own browsing — a page that serves " +
+      "you something different from what it serves us will otherwise produce quotes that are honest and still rejected.\n\n" +
+      "The archived copy is also what the learner sees when they click a cited sentence, so a page that fails here is one " +
+      "nobody can check. Pick another source rather than citing it anyway.",
+    inputSchema: {
+      courseId: z.string().optional(),
+      url: z.string().describe("The page to archive"),
+      title: z.string().describe("Human-readable title, shown to the learner"),
+      limit: z.number().int().min(1000).max(80000).default(40000).describe("Characters of text to return"),
+    },
+  },
+  async ({ courseId, url, title, limit }) =>
+    guard(async () => {
+      const id = courseIdOr(courseId);
+      const res = await api.post<{ url: string; chars: number; truncated: boolean; text: string }>(
+        `/api/courses/${id}/sources`,
+        { url, title, limit },
+      );
+      return ok(
+        `Archived ${res.url} (${res.chars} characters).` +
+          (res.truncated ? ` Showing the first ${limit}.` : "") +
+          `\n\n${res.text}`,
+      );
+    }),
+);
+
+server.registerTool(
   "research_note",
   {
     title: "Record research",
     description:
-      "Save research notes and sources onto the course. Call this after researching and before course_plan. Notes are shown " +
-      "to the learner under 'About this course' and are also given back to you when authoring individual lessons, so record " +
-      "the specific facts, numbers, formulas, and worked examples you will need later — not a summary of what you read.",
+      "Record what you found as CLAIMS: each fact paired with the words in a source that support it.\n\n" +
+      "Call source_add first for every page you intend to use — it archives the page and hands back its text. Quote from " +
+      "THAT text, word for word. Every quote is checked against the archived copy before the call succeeds, and a claim " +
+      "whose quote is not found is rejected with the closest passage it did find. Do not reconstruct a quote from memory; " +
+      "copy it.\n\n" +
+      "The claim ids returned here are what lesson_write requires to cite each paragraph, so gather the specific facts, " +
+      "numbers, formulas and worked examples you will need later — not a summary of what you read.\n\n" +
+      "`notes` is prose shown to the learner under 'About this course' and given back to you when authoring; it carries no " +
+      "citations itself and is optional.",
     inputSchema: {
       courseId: z.string().optional(),
-      notes: z.string().describe("Markdown. Concrete facts, definitions, formulas, common misconceptions."),
+      notes: z.string().default("").describe("Markdown overview for the learner. Optional."),
+      claims: z
+        .array(
+          z.object({
+            text: z.string().describe("The fact, in your own words — this is what you will teach from"),
+            sourceUrl: z.string().describe("URL of a page already passed to source_add"),
+            quote: z
+              .string()
+              .describe("Word for word from that page's archived text. Checked; invented quotes are rejected."),
+          }),
+        )
+        .default([]),
       sources: z
         .array(z.object({ title: z.string(), url: z.string().optional(), note: z.string().optional() }))
-        .default([]),
+        .default([])
+        .describe("Extra sources to archive. Prefer source_add, which returns the text you must quote from."),
       append: z.boolean().default(true).describe("Append to existing notes rather than replacing them"),
     },
   },
-  async ({ courseId, notes, sources, append }) =>
+  async ({ courseId, notes, claims, sources, append }) =>
     guard(async () => {
       const id = courseIdOr(courseId);
-      await api.post(`/api/courses/${id}/research`, { notes, sources, append });
-      return ok(`Saved ${notes.length} characters of notes and ${sources.length} source(s).`);
+      const res = await api.post<{ claims: Array<{ id: string; text: string }> }>(
+        `/api/courses/${id}/research`,
+        { notes, claims, sources, append },
+      );
+      // The ids are the point of the reply: lesson_write cannot cite without them.
+      return ok(
+        `Verified ${claims.length} claim(s) against their sources.\n\n` +
+          res.claims.map((c) => `${c.id}  ${c.text}`).join("\n"),
+      );
     }),
 );
 
@@ -270,9 +328,18 @@ server.registerTool(
     title: "Write one lesson",
     description:
       "Write the teaching notes and exercises for a single lesson. Call once per lesson id from course_plan/course_get.\n\n" +
-      "NOTES (markdown, 120-250 words): teach the idea itself. Lead with the intuition, then the precise statement, then a " +
-      "concrete example with real numbers. Inline math as $x$ and display math as $$x$$; fenced code blocks are supported. " +
-      "Do not open with 'In this lesson we will…' — just teach.\n\n" +
+      "BLOCKS (the teaching notes, 120-250 words total): one entry per paragraph, list, heading or equation, in reading " +
+      "order. Lead with the intuition, then the precise statement, then a concrete example with real numbers. Inline math " +
+      "as $x$ and display math as $$x$$; fenced code blocks are supported. Do not open with 'In this lesson we will…' — " +
+      "just teach.\n\n" +
+      "CITATIONS: every block of prose must list at least one claim id in `cites`, taken from what research_note returned. " +
+      "Write from the claims you gathered; if a paragraph has no claim behind it, you are writing something you did not " +
+      "verify — go and research it, or cut it. Headings, equations and short connectives do not need citations. The call " +
+      "fails and names the offending blocks if any prose is uncited.\n\n" +
+      "Cite the claim each paragraph actually rests on, not the nearest one. The server measures how much of each " +
+      "paragraph's wording is accounted for by the claim it names, and the learner is shown that grade — a paragraph " +
+      "labelled with a claim it only loosely relates to is displayed as unsupported, which is worse for you than " +
+      "splitting it into two properly-cited paragraphs.\n\n" +
       "EXERCISES (4-8): every one must be answerable from the notes alone. Vary the type — a lesson that is eight multiple " +
       "choice questions in a row is a bad lesson. Order them easy → hard. Write distractors that represent real " +
       "misconceptions, not obvious throwaways; a learner who has not understood should be genuinely tempted. Give every " +
@@ -282,16 +349,28 @@ server.registerTool(
     inputSchema: {
       courseId: z.string().optional(),
       lessonId: z.string().describe("From course_plan or course_get"),
-      notes: z.string().describe("Markdown taught before the exercises begin"),
+      blocks: z
+        .array(
+          z.object({
+            markdown: z.string().describe("One paragraph, list, heading or equation"),
+            cites: z
+              .array(z.string())
+              .default([])
+              .describe("Claim ids from research_note that back this block. Required for prose."),
+          }),
+        )
+        .min(1)
+        .max(30)
+        .describe("The lesson's notes, split into blocks so each can be traced to a source"),
       exercises: z.array(exerciseSchema).min(3).max(12),
     },
   },
-  async ({ courseId, lessonId, notes, exercises }) =>
+  async ({ courseId, lessonId, blocks, exercises }) =>
     guard(async () => {
       const id = courseIdOr(courseId);
       const result = await api.post<{ title: string; exerciseCount: number; remaining: number }>(
         `/api/courses/${id}/lessons/${lessonId}`,
-        { notes, exercises },
+        { blocks, exercises },
       );
       return ok(
         `Wrote “${result.title}” with ${result.exerciseCount} exercises. ${

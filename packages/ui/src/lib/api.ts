@@ -2,6 +2,8 @@ import type {
   Answer,
   AnswerResponse,
   AppConfig,
+  ArchivedSource,
+  BlockProvenance,
   BuildConfig,
   BuildJob,
   ChatTurn,
@@ -92,7 +94,41 @@ export const api = {
    *  the server is stateless between turns, see chatReplyPrompt. */
   chat: (input: { messages: ChatTurn[]; driver?: string; model?: string }) =>
     call<InterviewReply>("POST", "/api/build/chat", input),
-  resume: (id: string) => call<{ job: BuildJob }>("POST", `/api/courses/${id}/resume`, {}),
+  /** One turn of the lesson tutor. Stateless — the whole transcript goes each time. */
+  lessonChat: (courseId: string, lessonId: string, turns: ChatTurn[], turnId?: string) =>
+    call<{ text: string; driver: string }>("POST", `/api/courses/${courseId}/lessons/${lessonId}/chat`, {
+      turns,
+      turnId,
+    }),
+  provenance: (courseId: string, lessonId: string) =>
+    call<{ blocks: BlockProvenance[]; verified: boolean; proseCount: number; archived: number; sourceCount: number }>(
+      "GET",
+      `/api/courses/${courseId}/lessons/${lessonId}/provenance`,
+    ),
+  /** URL of the archived page as a document, for the viewer's iframe. */
+  documentUrl: (courseId: string, hit: BlockProvenance) =>
+    `/api/courses/${courseId}/archives/${hit.sourceId}/document` +
+    (hit.claimId ? `?claim=${encodeURIComponent(hit.claimId)}` : hit.quote ? `?quote=${encodeURIComponent(hit.quote)}` : "") +
+    "#mh-cited",
+  archivedSource: (courseId: string, sourceId: string) =>
+    call<ArchivedSource>("GET", `/api/courses/${courseId}/archives/${sourceId}`),
+  archiveSources: (courseId: string) =>
+    call<{ archived: number; total: number; failed: Array<{ title: string; url: string; failure?: string }> }>(
+      "POST",
+      `/api/courses/${courseId}/archive`,
+      {},
+    ),
+  archivedCount: (courseId: string) =>
+    call<{ archives: Array<{ id: string; title: string; ok: boolean }> }>("GET", `/api/courses/${courseId}/archives`).then(
+      (res) => ({ archived: res.archives.filter((a) => a.ok).length }),
+    ),
+  createFixture: () => call<{ course: CourseSummary }>("POST", "/api/dev/fixture", {}),
+  /** A real one-unit, one-lesson build. Limits are fixed by the server. */
+  devProbe: (topic: string) =>
+    call<{ job: BuildJob; course: CourseSummary }>("POST", "/api/dev/probe", { topic }),
+  /** "next" writes only the next unwritten unit; "all" writes every one that is left. */
+  resume: (id: string, scope: "next" | "all" = "next") =>
+    call<{ job: BuildJob }>("POST", `/api/courses/${id}/resume`, { scope }),
 
   /** Ask the agent to re-check one lesson against an objection. Slow — it runs a
    *  full agent turn — so callers should show a spinner rather than a skeleton. */
